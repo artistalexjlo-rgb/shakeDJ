@@ -122,9 +122,13 @@ final class DeckView extends View {
         }
         paint.setAlpha(255);
         paint.setTextSize(11 * dp);
-        paint.setColor(Color.rgb(110, 110, 125));
+        int lat = engine.outputLatencyMs;
+        paint.setColor(lat > 60 ? Color.rgb(255, 150, 40) : Color.rgb(110, 110, 125));
         paint.setTextAlign(Paint.Align.RIGHT);
-        c.drawText("вывод ~" + engine.outputLatencyMs + " мс", w - 10 * dp, dotY + 4 * dp, paint);
+        String route = engine.routeName;
+        String out = lat + " мс" + (route.isEmpty() ? "" : " · " + route)
+                + (!engine.fastPath && !engine.routeBluetooth ? " · без быстрого пути" : "");
+        c.drawText(out, w - 10 * dp, dotY + 4 * dp, paint);
         paint.setTextAlign(Paint.Align.CENTER);
 
         float sp = engine.speedNow;

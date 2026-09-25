@@ -20,8 +20,8 @@ APKSIGNER="${APKSIGNER:-$(command -v apksigner || echo "$BT/apksigner")}"
 PKG=com.shakedj.app
 MIN_SDK=26
 TARGET_SDK=35
-VERSION_CODE="${VERSION_CODE:-2}"
-VERSION_NAME="${VERSION_NAME:-0.2}"
+VERSION_CODE="${VERSION_CODE:-3}"
+VERSION_NAME="${VERSION_NAME:-0.3}"
 
 SRC="$ROOT/app/src/main"
 OUT="$ROOT/build/manual"

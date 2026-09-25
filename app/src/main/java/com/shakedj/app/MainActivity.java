@@ -56,6 +56,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private int peakIdx;
     private long lastPeakMs, cooldownUntilMs, lastStreamFilterMs;
     private boolean tiltEnabled = true;
+    private boolean warnedBluetooth;
 
     /** -1 = cycle through all break types. */
     private int breakMode = -1;
@@ -219,6 +220,8 @@ public class MainActivity extends Activity implements SensorEventListener {
                 } else if (!streamFilter.open()) {
                     b.setChecked(false);
                     toast("Этот телефон не даёт фильтровать звук других приложений");
+                } else {
+                    toast("Системный эквалайзер на части телефонов увеличивает задержку пэдов");
                 }
             }
         });
@@ -329,6 +332,12 @@ public class MainActivity extends Activity implements SensorEventListener {
                 seek.setSecondaryProgress((int) (t.decodedFrames / (double) t.sampleRate / Math.max(1e-3, dur) * 1000));
             }
             refreshPlay();
+            boolean bt = engine.routeBluetooth;
+            if (bt && !warnedBluetooth) {
+                Toast.makeText(MainActivity.this, "Звук идёт через Bluetooth: это добавляет 150–300 мс задержки. "
+                        + "Для пэдов лучше динамик телефона или проводные наушники", Toast.LENGTH_LONG).show();
+            }
+            warnedBluetooth = bt;
             ui.postDelayed(this, 200);
         }
     };

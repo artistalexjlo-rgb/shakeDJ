@@ -2,6 +2,7 @@ package com.shakedj.app;
 
 import android.content.Context;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTimestamp;
@@ -36,7 +37,12 @@ final class AudioEngine {
 
     final int sampleRate;
     private final int burst;
-    private final AudioTrack out;
+    private AudioTrack out;
+    private boolean floatOut;
+    private short[] shortBuf;
+    /** Engine clock at the moment the current AudioTrack started (its frame counter starts at 0). */
+    private long clockBase;
+    private int routedId = -1;
     private final float[][] kit;
     private final ConcurrentLinkedQueue<Runnable> commands = new ConcurrentLinkedQueue<Runnable>();
     private volatile boolean running;
@@ -59,6 +65,10 @@ final class AudioEngine {
     /** Beats since a downbeat at the moment that is audible now; NaN without a grid. */
     volatile double beatNow = Double.NaN;
     volatile int outputLatencyMs;
+    /** Where the sound goes ("динамик", "Bluetooth", ...) and whether Android gave us its fast mixer path. */
+    volatile String routeName = "";
+    volatile boolean routeBluetooth;
+    volatile boolean fastPath;
 
     // Audio-thread state.
     private volatile Track track;
@@ -106,26 +116,122 @@ final class AudioEngine {
         burst = Math.max(32, Math.min(parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER), 192), 2048));
         kit = DrumKit.build(sampleRate);
 
-        int minBytes = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_FLOAT);
-        out = new AudioTrack.Builder()
+        shortBuf = new short[burst * 2];
+        openOutput();
+        fadeLen = (int) (0.004 * sampleRate);
+    }
+
+    /**
+     * Opens the output, preferring a track that Android puts on its fast (low-latency) mixer path.
+     * Some phones only grant it for 16-bit PCM or for game audio, so those are tried in turn; without
+     * the fast path the sound goes through the deep "music" buffer, which adds 100+ ms.
+     */
+    private void openOutput() {
+        int[][] configs = {
+                {AudioFormat.ENCODING_PCM_FLOAT, AudioAttributes.USAGE_MEDIA},
+                {AudioFormat.ENCODING_PCM_16BIT, AudioAttributes.USAGE_MEDIA},
+                {AudioFormat.ENCODING_PCM_16BIT, AudioAttributes.USAGE_GAME},
+        };
+        AudioTrack chosen = null;
+        boolean chosenFloat = false;
+        RuntimeException error = null;
+        for (int[] c : configs) {
+            AudioTrack t;
+            try {
+                t = buildTrack(c[0], c[1]);
+            } catch (RuntimeException e) {
+                error = e;
+                continue;
+            }
+            boolean fast = t.getPerformanceMode() == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY;
+            if (chosen == null || fast) {
+                if (chosen != null) chosen.release();
+                chosen = t;
+                chosenFloat = c[0] == AudioFormat.ENCODING_PCM_FLOAT;
+            } else {
+                t.release();
+            }
+            if (fast) break;
+        }
+        if (chosen == null) throw error != null ? error : new IllegalStateException("no audio output");
+        out = chosen;
+        floatOut = chosenFloat;
+        fastPath = out.getPerformanceMode() == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY;
+        // Blocking writes keep the buffer full, so its fill level *is* the latency: start at two bursts.
+        out.setBufferSizeInFrames(burst * 2);
+    }
+
+    private AudioTrack buildTrack(int encoding, int usage) {
+        int bytesPerFrame = encoding == AudioFormat.ENCODING_PCM_FLOAT ? 8 : 4;
+        int minBytes = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, encoding);
+        return new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setUsage(usage)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build())
                 .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                        .setEncoding(encoding)
                         .setSampleRate(sampleRate)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                         .build())
                 // Capacity leaves room for the latency tuner to grow into.
-                .setBufferSizeInBytes(Math.max(minBytes, burst * 8 * 8))
+                .setBufferSizeInBytes(Math.max(minBytes, burst * 8 * bytesPerFrame))
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
-        // Blocking writes keep the buffer full, so its fill level *is* the latency: start at two bursts.
-        out.setBufferSizeInFrames(burst * 2);
-        fadeLen = (int) (0.004 * sampleRate);
+    }
+
+    /** Re-opens the output after a route change, so returning from Bluetooth regains the fast path. */
+    private void reopenOutput() {
+        out.pause();
+        out.flush();
+        out.release();
+        openOutput();
+        clockBase = clock;
+        tsFrame = -1;
+        out.play();
+    }
+
+    private void pollRoute(boolean mayReopen) {
+        AudioDeviceInfo dev = out.getRoutedDevice();
+        if (dev == null || dev.getId() == routedId) return;
+        boolean changed = routedId != -1;
+        routedId = dev.getId();
+        if (changed && mayReopen) {
+            reopenOutput();
+            dev = out.getRoutedDevice();
+            if (dev != null) routedId = dev.getId();
+        }
+        int type = dev != null ? dev.getType() : AudioDeviceInfo.TYPE_UNKNOWN;
+        routeBluetooth = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                || type == AudioDeviceInfo.TYPE_BLE_HEADSET || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                || type == AudioDeviceInfo.TYPE_BLE_BROADCAST || type == AudioDeviceInfo.TYPE_HEARING_AID;
+        routeName = routeName(type);
+    }
+
+    private static String routeName(int type) {
+        switch (type) {
+            case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER:
+            case AudioDeviceInfo.TYPE_BUILTIN_EARPIECE:
+                return "динамик";
+            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:
+            case AudioDeviceInfo.TYPE_WIRED_HEADSET:
+            case AudioDeviceInfo.TYPE_LINE_ANALOG:
+                return "провод";
+            case AudioDeviceInfo.TYPE_USB_HEADSET:
+            case AudioDeviceInfo.TYPE_USB_DEVICE:
+            case AudioDeviceInfo.TYPE_USB_ACCESSORY:
+                return "USB";
+            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
+            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+            case AudioDeviceInfo.TYPE_BLE_HEADSET:
+            case AudioDeviceInfo.TYPE_BLE_SPEAKER:
+            case AudioDeviceInfo.TYPE_BLE_BROADCAST:
+            case AudioDeviceInfo.TYPE_HEARING_AID:
+                return "Bluetooth";
+            default:
+                return "выход " + type;
+        }
     }
 
     private static int parseOr(String s, int def) {
@@ -280,20 +386,34 @@ final class AudioEngine {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         float[] buf = new float[burst * 2];
         out.play();
-        int blocks = 0, underruns = 0;
+        pollRoute(false);
+        int blocks = 0, underruns = 0, openedAt = 0;
         while (running) {
             Runnable r;
             while ((r = commands.poll()) != null) r.run();
             render(buf, burst);
-            out.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
-            if ((++blocks & 15) == 0) {
+            if (floatOut) {
+                out.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
+            } else {
+                for (int i = 0; i < buf.length; i++) shortBuf[i] = (short) (buf[i] * 32767f);
+                out.write(shortBuf, 0, shortBuf.length, AudioTrack.WRITE_BLOCKING);
+            }
+            if ((++blocks & 63) == 0) {
+                int before = routedId;
+                pollRoute(true);
+                if (routedId != before && before != -1) openedAt = blocks;
+            }
+            if ((blocks & 15) == 0) {
                 if (out.getTimestamp(ts)) {
                     tsFrame = ts.framePosition;
                     tsNanos = ts.nanoTime;
                 }
                 // Latency tuner: grow the buffer one burst at a time only if the device glitches.
+                // Underruns while the stream is starting up don't count.
                 int u = out.getUnderrunCount();
-                if (u > underruns) {
+                if (blocks - openedAt < 128) {
+                    underruns = u;
+                } else if (u > underruns) {
                     underruns = u;
                     int size = out.getBufferSizeInFrames();
                     if (size + burst <= out.getBufferCapacityInFrames()) out.setBufferSizeInFrames(size + burst);
@@ -307,7 +427,7 @@ final class AudioEngine {
 
     /** Engine-clock frame that is (or was) coming out of the speaker at {@code nanoTime}. */
     private long heardClock(long nanoTime) {
-        if (tsFrame >= 0) return tsFrame + (long) ((nanoTime - tsNanos) * (double) sampleRate / 1e9);
+        if (tsFrame >= 0) return clockBase + tsFrame + (long) ((nanoTime - tsNanos) * (double) sampleRate / 1e9);
         return clock - out.getBufferSizeInFrames();
     }
 
