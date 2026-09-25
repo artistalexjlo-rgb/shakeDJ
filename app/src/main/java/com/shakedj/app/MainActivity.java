@@ -259,7 +259,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         help.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         help.setText("Тряхни — брейк (с доли до «раза») · наклон вбок — фильтр, экраном вниз — «под водой» · "
                 + "тап — бочка, второй палец — клэп · тяни вниз/вверх — темп (отпустил — сразу обратно) · "
-                + "вбок — скретч (ширина экрана = пол-доли, отпустил — трек в долю) · держи — луп · "
+                + "вбок — скретч поверх трека (ширина экрана = пол-доли) · держи — луп · "
                 + "«1» — отметить первую долю, BPM — стучи темп начиная с «раза»");
         help.setPadding(dp(4), 0, dp(4), dp(4));
         root.addView(help);
@@ -292,13 +292,13 @@ public class MainActivity extends Activity implements SensorEventListener {
             }
 
             @Override
-            public void onScratchStart() {
-                engine.startScratch();
+            public void onScratchStart(long nanos) {
+                engine.startScratch(nanos);
             }
 
             @Override
-            public void onScratchMove(double beats) {
-                engine.scratchBeats = beats;
+            public void onScratchMove(double beats, long nanos) {
+                engine.moveScratch(beats, nanos);
             }
 
             @Override
@@ -445,7 +445,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
 
     /** Touch-down time on the CLOCK_MONOTONIC timeline shared with System.nanoTime and audio timestamps. */
-    private static long eventNanos(MotionEvent e) {
+    static long eventNanos(MotionEvent e) {
         if (Build.VERSION.SDK_INT >= 34) return e.getEventTimeNanos();
         return e.getEventTime() * 1_000_000L;
     }

@@ -1,12 +1,6 @@
 package com.shakedj.app;
 
 import android.content.Context;
-import android.media.AudioAttributes;
-import android.media.AudioDeviceInfo;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioTimestamp;
-import android.media.AudioTrack;
 import android.os.Process;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -31,6 +25,11 @@ final class AudioEngine {
     static final String[] FX_NAMES = {"РОЛЛ", "ДРОП", "СТОП", "СПИН", "ЛУП", "ФИЛЛ", "СКРЕТЧ"};
     /** A full-width scratch stroke moves the record by this many beats. */
     static final double SCRATCH_BEATS_PER_WIDTH = 0.5;
+    /** Touch samples are replayed this late so the scratch can glide between them instead of stepping. */
+    private static final long SCRATCH_DEJITTER_NS = 20_000_000L;
+    private static final int SCRATCH_RING = 32;
+    /** Level of the track underneath while scratching, so the scratch sits on top. */
+    private static final float SCRATCH_BED = 0.55f;
 
     private static final int MAX_VOICES = 24;
     private static final int MAX_EVENTS = 128;
@@ -42,11 +41,11 @@ final class AudioEngine {
     private static final float FILTER_K = 0.8f;
 
     final int sampleRate;
-    private final int burst;
-    private AudioTrack out;
-    private boolean floatOut;
-    private short[] shortBuf;
-    /** Engine clock at the moment the current AudioTrack started (its frame counter starts at 0). */
+    private final Context ctx;
+    private AudioOutput out;
+    private int burst;
+    private boolean preferNative = true;
+    /** Engine clock at the moment the current output started (its frame counter starts at 0). */
     private long clockBase;
     private int routedId = -1;
     private final float[][] kit;
@@ -63,8 +62,6 @@ final class AudioEngine {
     volatile float drumLevel = 1.2f;
     /** 0..1: how deep drum hits duck the track. The track recovers over half a beat. */
     volatile float sidechain = 0.5f;
-    /** Scratch stroke in beats from where the finger landed; written by the UI while scratching. */
-    volatile double scratchBeats;
 
     // Readouts for the UI.
     volatile double positionSec;
@@ -79,6 +76,8 @@ final class AudioEngine {
     volatile String routeName = "";
     volatile boolean routeBluetooth;
     volatile boolean fastPath;
+    volatile String outputApi = "";
+    volatile int bufferMs;
 
     // Audio-thread state.
     private volatile Track track;
@@ -96,7 +95,14 @@ final class AudioEngine {
     private final int fadeLen;
     private float famt, ic1l, ic2l, ic1r, ic2r;
     private float scKey, scDuck, limGain = 1f;
-    private double scratchPos;
+
+    // Scratch voice: a second read head over the track, driven by the finger.
+    private boolean scratching, scratchReleasing;
+    private double scratchAnchor;
+    private float scratchEnv, bedGain = 1f;
+    private final long[] scT = new long[SCRATCH_RING];
+    private final double[] scB = new double[SCRATCH_RING];
+    private int scN;
 
     // Beat grids.
     private boolean trackGrid;
@@ -105,7 +111,7 @@ final class AudioEngine {
     private long clockGridOffset;
 
     // Output timing: which rendered frame is audible when, and where the track timeline was.
-    private final AudioTimestamp ts = new AudioTimestamp();
+    private final long[] ts = new long[2];
     private long tsFrame = -1, tsNanos;
     private final long[] hClock = new long[HISTORY];
     private final double[] hPos = new double[HISTORY];
@@ -123,136 +129,43 @@ final class AudioEngine {
     private int evN;
 
     AudioEngine(Context ctx) {
-        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
-        sampleRate = parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE), 48000);
-        burst = Math.max(32, Math.min(parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER), 192), 2048));
+        this.ctx = ctx.getApplicationContext();
+        out = AudioOutput.open(this.ctx, 0, preferNative);
+        sampleRate = out.sampleRate;
+        burst = out.burst;
         kit = DrumKit.build(sampleRate);
-
-        shortBuf = new short[burst * 2];
-        openOutput();
         fadeLen = (int) (0.004 * sampleRate);
+        describeOutput();
     }
 
-    /**
-     * Opens the output, preferring a track that Android puts on its fast (low-latency) mixer path.
-     * Some phones only grant it for 16-bit PCM or for game audio, so those are tried in turn; without
-     * the fast path the sound goes through the deep "music" buffer, which adds 100+ ms.
-     */
-    private void openOutput() {
-        int[][] configs = {
-                {AudioFormat.ENCODING_PCM_FLOAT, AudioAttributes.USAGE_MEDIA},
-                {AudioFormat.ENCODING_PCM_16BIT, AudioAttributes.USAGE_MEDIA},
-                {AudioFormat.ENCODING_PCM_16BIT, AudioAttributes.USAGE_GAME},
-        };
-        AudioTrack chosen = null;
-        boolean chosenFloat = false;
-        RuntimeException error = null;
-        for (int[] c : configs) {
-            AudioTrack t;
-            try {
-                t = buildTrack(c[0], c[1]);
-            } catch (RuntimeException e) {
-                error = e;
-                continue;
-            }
-            boolean fast = t.getPerformanceMode() == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY;
-            if (chosen == null || fast) {
-                if (chosen != null) chosen.release();
-                chosen = t;
-                chosenFloat = c[0] == AudioFormat.ENCODING_PCM_FLOAT;
-            } else {
-                t.release();
-            }
-            if (fast) break;
-        }
-        if (chosen == null) throw error != null ? error : new IllegalStateException("no audio output");
-        out = chosen;
-        floatOut = chosenFloat;
-        fastPath = out.getPerformanceMode() == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY;
-        // Blocking writes keep the buffer full, so its fill level *is* the latency: start at two bursts.
-        out.setBufferSizeInFrames(burst * 2);
-    }
-
-    private AudioTrack buildTrack(int encoding, int usage) {
-        int bytesPerFrame = encoding == AudioFormat.ENCODING_PCM_FLOAT ? 8 : 4;
-        int minBytes = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, encoding);
-        return new AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(usage)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build())
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(encoding)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                        .build())
-                // Capacity leaves room for the latency tuner to grow into.
-                .setBufferSizeInBytes(Math.max(minBytes, burst * 8 * bytesPerFrame))
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build();
-    }
-
-    /** Re-opens the output after a route change, so returning from Bluetooth regains the fast path. */
+    /** Re-opens the output (route change, lost stream) at the engine's rate. */
     private void reopenOutput() {
-        out.pause();
-        out.flush();
-        out.release();
-        openOutput();
+        out.close();
+        try {
+            out = AudioOutput.open(ctx, sampleRate, preferNative);
+        } catch (RuntimeException e) {
+            // AAudio refused the engine's rate on the new route: fall back to AudioTrack.
+            preferNative = false;
+            out = AudioOutput.open(ctx, sampleRate, false);
+        }
+        if (out.sampleRate != sampleRate) {
+            out.close();
+            preferNative = false;
+            out = AudioOutput.open(ctx, sampleRate, false);
+        }
+        burst = out.burst;
         clockBase = clock;
         tsFrame = -1;
-        out.play();
+        out.start();
+        describeOutput();
     }
 
-    private void pollRoute(boolean mayReopen) {
-        AudioDeviceInfo dev = out.getRoutedDevice();
-        if (dev == null || dev.getId() == routedId) return;
-        boolean changed = routedId != -1;
-        routedId = dev.getId();
-        if (changed && mayReopen) {
-            reopenOutput();
-            dev = out.getRoutedDevice();
-            if (dev != null) routedId = dev.getId();
-        }
-        int type = dev != null ? dev.getType() : AudioDeviceInfo.TYPE_UNKNOWN;
-        routeBluetooth = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                || type == AudioDeviceInfo.TYPE_BLE_HEADSET || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
-                || type == AudioDeviceInfo.TYPE_BLE_BROADCAST || type == AudioDeviceInfo.TYPE_HEARING_AID;
-        routeName = routeName(type);
-    }
-
-    private static String routeName(int type) {
-        switch (type) {
-            case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER:
-            case AudioDeviceInfo.TYPE_BUILTIN_EARPIECE:
-                return "динамик";
-            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:
-            case AudioDeviceInfo.TYPE_WIRED_HEADSET:
-            case AudioDeviceInfo.TYPE_LINE_ANALOG:
-                return "провод";
-            case AudioDeviceInfo.TYPE_USB_HEADSET:
-            case AudioDeviceInfo.TYPE_USB_DEVICE:
-            case AudioDeviceInfo.TYPE_USB_ACCESSORY:
-                return "USB";
-            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
-            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
-            case AudioDeviceInfo.TYPE_BLE_HEADSET:
-            case AudioDeviceInfo.TYPE_BLE_SPEAKER:
-            case AudioDeviceInfo.TYPE_BLE_BROADCAST:
-            case AudioDeviceInfo.TYPE_HEARING_AID:
-                return "Bluetooth";
-            default:
-                return "выход " + type;
-        }
-    }
-
-    private static int parseOr(String s, int def) {
-        try {
-            int v = Integer.parseInt(s);
-            return v > 0 ? v : def;
-        } catch (Exception e) {
-            return def;
-        }
+    private void describeOutput() {
+        routedId = out.deviceId();
+        fastPath = out.fast();
+        outputApi = out.api();
+        routeName = AudioOutput.routeName(ctx, routedId);
+        routeBluetooth = AudioOutput.isBluetooth(ctx, routedId);
     }
 
     void start() {
@@ -275,7 +188,7 @@ final class AudioEngine {
             } catch (InterruptedException ignored) {
             }
         }
-        out.release();
+        out.close();
     }
 
     void post(Runnable r) {
@@ -383,34 +296,73 @@ final class AudioEngine {
         });
     }
 
-    /** Finger lands on the record: it stops under the finger, the timeline keeps running (slip). */
-    void startScratch() {
-        scratchBeats = 0;
+    /**
+     * Finger lands on the record. A second read head starts on the beat that is audible now and
+     * follows the finger on top of the track, which keeps playing underneath.
+     */
+    void startScratch(final long nanos) {
         post(new Runnable() {
             @Override
             public void run() {
-                if (fx != FX_NONE || track == null || !playing) return;
-                pendingFx = FX_NONE;
-                fx = FX_SCRATCH;
-                fxStart = clock;
-                fxLen = Long.MAX_VALUE;
-                fxBeat = beatFrames();
-                fxAnchor = pos;
-                slipPos = pos;
-                scratchPos = pos;
-                publishFx(FX_SCRATCH);
+                Track t = track;
+                if (t == null) return;
+                double ratio = (double) t.sampleRate / sampleRate;
+                double heard = timelineAt(heardClock(System.nanoTime()));
+                if (Double.isNaN(heard)) heard = pos;
+                if (trackGrid) {
+                    double beatT = beatFrames() * ratio;
+                    double off = gridOffsetSec * t.sampleRate;
+                    heard = off + Math.floor((heard - off) / beatT) * beatT;
+                }
+                scratchAnchor = Math.max(0, heard);
+                scratching = true;
+                scratchReleasing = false;
+                scN = 0;
+                addScratchPoint(nanos, 0);
+                if (fxNow == FX_NONE) publishFx(FX_SCRATCH);
             }
         });
     }
 
-    /** Finger lifted: the track drops back in exactly where it would have been, so it stays on the beat. */
+    /** Record displacement in beats since the finger landed, stamped with the touch event time. */
+    void moveScratch(final double beats, final long nanos) {
+        post(new Runnable() {
+            @Override
+            public void run() {
+                if (scratching) addScratchPoint(nanos, beats);
+            }
+        });
+    }
+
     void stopScratch() {
         post(new Runnable() {
             @Override
             public void run() {
-                if (fx == FX_SCRATCH) endFx();
+                scratchReleasing = true;
+                if (fxNow == FX_SCRATCH) fxNow = FX_NONE;
             }
         });
+    }
+
+    private void addScratchPoint(long nanos, double beats) {
+        if (scN > 0 && nanos <= scT[(scN - 1) % SCRATCH_RING]) nanos = scT[(scN - 1) % SCRATCH_RING] + 1;
+        scT[scN % SCRATCH_RING] = nanos;
+        scB[scN % SCRATCH_RING] = beats;
+        scN++;
+    }
+
+    /** Finger position (beats) at {@code nanos}, linearly interpolated between touch samples. */
+    private double scratchAt(long nanos) {
+        int newest = scN - 1, oldest = Math.max(0, scN - SCRATCH_RING);
+        if (nanos >= scT[newest % SCRATCH_RING]) return scB[newest % SCRATCH_RING];
+        for (int k = newest; k > oldest; k--) {
+            int i = k % SCRATCH_RING, j = (k - 1) % SCRATCH_RING;
+            if (scT[j] <= nanos) {
+                double f = (nanos - scT[j]) / (double) (scT[i] - scT[j]);
+                return scB[j] + (scB[i] - scB[j]) * f;
+            }
+        }
+        return scB[oldest % SCRATCH_RING];
     }
 
     void stopLoop() {
@@ -427,50 +379,54 @@ final class AudioEngine {
     private void loop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         float[] buf = new float[burst * 2];
-        out.play();
-        pollRoute(false);
-        int blocks = 0, underruns = 0, openedAt = 0;
+        out.start();
+        int blocks = 0, xruns = 0, openedAt = 0;
         while (running) {
             Runnable r;
             while ((r = commands.poll()) != null) r.run();
+            if (buf.length < burst * 2) buf = new float[burst * 2];
             render(buf, burst);
-            if (floatOut) {
-                out.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
-            } else {
-                for (int i = 0; i < buf.length; i++) shortBuf[i] = (short) (buf[i] * 32767f);
-                out.write(shortBuf, 0, shortBuf.length, AudioTrack.WRITE_BLOCKING);
+            boolean ok = out.write(buf, burst);
+            blocks++;
+            // A lost stream (AAudio disconnects on route changes) or a new route: reopen, so we
+            // get the best path for the new device (e.g. the fast path back after Bluetooth).
+            boolean rerouted = false;
+            if ((blocks & 63) == 0) {
+                int dev = out.deviceId();
+                if (dev != 0 && dev != routedId) {
+                    if (routedId == 0) describeOutput(); // first report after start, not a change
+                    else rerouted = true;
+                }
             }
-            if ((++blocks & 63) == 0) {
-                int before = routedId;
-                pollRoute(true);
-                if (routedId != before && before != -1) openedAt = blocks;
+            if (!ok || rerouted) {
+                reopenOutput();
+                openedAt = blocks;
+                continue;
             }
             if ((blocks & 15) == 0) {
-                if (out.getTimestamp(ts)) {
-                    tsFrame = ts.framePosition;
-                    tsNanos = ts.nanoTime;
+                if (out.timestamp(ts)) {
+                    tsFrame = ts[0];
+                    tsNanos = ts[1];
                 }
                 // Latency tuner: grow the buffer one burst at a time only if the device glitches.
                 // Underruns while the stream is starting up don't count.
-                int u = out.getUnderrunCount();
+                int u = out.xruns();
                 if (blocks - openedAt < 128) {
-                    underruns = u;
-                } else if (u > underruns) {
-                    underruns = u;
-                    int size = out.getBufferSizeInFrames();
-                    if (size + burst <= out.getBufferCapacityInFrames()) out.setBufferSizeInFrames(size + burst);
+                    xruns = u;
+                } else if (u > xruns) {
+                    xruns = u;
+                    int size = out.bufferFrames();
+                    if (size + burst <= out.capacityFrames()) out.setBufferFrames(size + burst);
                 }
+                bufferMs = out.bufferFrames() * 1000 / sampleRate;
             }
         }
-        out.pause();
-        out.flush();
-        out.stop();
     }
 
     /** Engine-clock frame that is (or was) coming out of the speaker at {@code nanoTime}. */
     private long heardClock(long nanoTime) {
         if (tsFrame >= 0) return clockBase + tsFrame + (long) ((nanoTime - tsNanos) * (double) sampleRate / 1e9);
-        return clock - out.getBufferSizeInFrames();
+        return clock - out.bufferFrames();
     }
 
     /** Track timeline position (ignoring effects) at engine-clock frame {@code c}; NaN if unknown. */
@@ -713,9 +669,11 @@ final class AudioEngine {
         float scRelease = (float) Math.exp(Math.log(0.05) / (0.5 * beatFrames()));
         float scAttack = (float) (1 - Math.exp(-1.0 / (0.003 * sampleRate)));
         float limRelease = (float) (1 - Math.exp(-1.0 / (0.08 * sampleRate)));
-        double scratchTarget = fx == FX_SCRATCH
-                ? fxAnchor + scratchBeats * beatFrames() * ratio : 0;
-        float scratchCoef = (float) (1 - Math.exp(-1.0 / (0.006 * sampleRate)));
+        long blockNanos = System.nanoTime() - SCRATCH_DEJITTER_NS;
+        double nanosPerFrame = 1e9 / sampleRate;
+        double scratchScale = beatFrames() * ratio;
+        float envStep = 1f / (0.004f * sampleRate);
+        float bedCoef = (float) (1 - Math.exp(-1.0 / (0.01 * sampleRate)));
 
         for (int i = 0; i < n; i++) {
             while (evN > 0 && evT[0] <= clock) popEvent();
@@ -760,13 +718,6 @@ final class AudioEngine {
                             gain = edge(loc, sl);
                             break;
                         }
-                        case FX_SCRATCH: {
-                            // The record follows the finger smoothly (no zipper noise from touch steps).
-                            scratchPos += (scratchTarget - scratchPos) * scratchCoef;
-                            if (scratchPos < 0) scratchPos = 0;
-                            rp = scratchPos;
-                            break;
-                        }
                         case FX_LOOP: {
                             double loc = (m + loopPhase) % b;
                             rp = fxAnchor + loc * ratio;
@@ -806,12 +757,35 @@ final class AudioEngine {
                     if (i0 + 1 < avail) {
                         float fr = (float) (rp - i0);
                         int k = i0 * 2;
-                        float s = gain * TRACK_LEVEL * (1f - scDepth * scDuck) / 32768f;
+                        float s = gain * bedGain * TRACK_LEVEL * (1f - scDepth * scDuck) / 32768f;
                         l = (d[k] + (d[k + 2] - d[k]) * fr) * s;
                         r = (d[k + 1] + (d[k + 3] - d[k + 1]) * fr) * s;
                     }
                 }
             }
+
+            // Scratch voice on top of the track.
+            if (scratching && t != null) {
+                if (scratchReleasing) {
+                    scratchEnv -= envStep;
+                    if (scratchEnv <= 0) {
+                        scratchEnv = 0;
+                        scratching = false;
+                    }
+                } else if (scratchEnv < 1f) {
+                    scratchEnv = Math.min(1f, scratchEnv + envStep);
+                }
+                double sp = scratchAnchor + scratchAt(blockNanos + (long) (i * nanosPerFrame)) * scratchScale;
+                int i0 = (int) sp;
+                if (sp >= 0 && i0 + 1 < avail) {
+                    float fr = (float) (sp - i0);
+                    int k = i0 * 2;
+                    float s = scratchEnv * TRACK_LEVEL / 32768f;
+                    l += (d[k] + (d[k + 2] - d[k]) * fr) * s;
+                    r += (d[k + 1] + (d[k + 3] - d[k + 1]) * fr) * s;
+                }
+            }
+            bedGain += ((scratching && !scratchReleasing ? SCRATCH_BED : 1f) - bedGain) * bedCoef;
 
             // DJ filter on the track only (drums stay punchy). Runs always to keep its state warm.
             float v0 = l + 1e-18f;

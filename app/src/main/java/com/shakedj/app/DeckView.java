@@ -28,10 +28,10 @@ final class DeckView extends View {
 
         void onHoldEnd();
 
-        void onScratchStart();
+        void onScratchStart(long nanos);
 
-        /** Record displacement in beats since the finger landed (negative = pulled back). */
-        void onScratchMove(double beats);
+        /** Record displacement in beats since the finger landed (negative = pulled back), at {@code nanos}. */
+        void onScratchMove(double beats, long nanos);
 
         void onScratchEnd();
     }
@@ -130,12 +130,12 @@ final class DeckView extends View {
         paint.setTextSize(11 * dp);
         int lat = engine.outputLatencyMs;
         paint.setColor(lat > 60 ? Color.rgb(255, 150, 40) : Color.rgb(110, 110, 125));
-        paint.setTextAlign(Paint.Align.RIGHT);
+        paint.setTextSize(10 * dp);
         String route = engine.routeName;
-        String out = lat + " мс" + (route.isEmpty() ? "" : " · " + route)
+        String out = lat + " мс" + (route.isEmpty() ? "" : " · " + route) + " · " + engine.outputApi
+                + " · буфер " + engine.bufferMs + " мс"
                 + (!engine.fastPath && !engine.routeBluetooth ? " · без быстрого пути" : "");
-        c.drawText(out, w - 10 * dp, dotY + 4 * dp, paint);
-        paint.setTextAlign(Paint.Align.CENTER);
+        c.drawText(ellipsize(out, w - 20 * dp), cx, dotY + 18 * dp, paint);
 
         float sp = engine.speedNow;
         if (Math.abs(sp - 1f) > 0.01f) {
@@ -215,7 +215,7 @@ final class DeckView extends View {
                             mode = -1;
                         } else {
                             mode = Math.abs(dy) >= Math.abs(dx) ? BEND : SCRATCH;
-                            if (mode == SCRATCH) cb.onScratchStart();
+                            if (mode == SCRATCH) cb.onScratchStart(MainActivity.eventNanos(e));
                         }
                     }
                 }
@@ -226,7 +226,12 @@ final class DeckView extends View {
                     cb.onSpeed(speed, 0.08f);
                 } else if (mode == SCRATCH) {
                     // The record moves with the finger; stroke length is measured in beats, not seconds.
-                    cb.onScratchMove((x - downX) / getWidth() * AudioEngine.SCRATCH_BEATS_PER_WIDTH);
+                    // Batched intermediate points are passed on too, so fast strokes stay smooth.
+                    double perPx = AudioEngine.SCRATCH_BEATS_PER_WIDTH / getWidth();
+                    for (int h = 0; h < e.getHistorySize(); h++) {
+                        cb.onScratchMove((e.getHistoricalX(h) - downX) * perPx, e.getHistoricalEventTime(h) * 1_000_000L);
+                    }
+                    cb.onScratchMove((x - downX) * perPx, MainActivity.eventNanos(e));
                 }
                 return true;
             }
