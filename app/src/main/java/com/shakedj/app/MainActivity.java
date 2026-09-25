@@ -2,6 +2,7 @@ package com.shakedj.app;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.hardware.Sensor;
@@ -16,6 +17,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
@@ -229,11 +231,35 @@ public class MainActivity extends Activity implements SensorEventListener {
         row2.addView(stream, weight(1f));
         root.addView(row2);
 
+        final SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        engine.drumLevel = prefs.getInt("pads", 120) / 100f;
+        engine.sidechain = prefs.getInt("sidechain", 50) / 100f;
+        LinearLayout row3 = row();
+        row3.setGravity(Gravity.CENTER_VERTICAL);
+        row3.addView(label("Пэды"));
+        row3.addView(slider(200, prefs.getInt("pads", 120), new SliderListener() {
+            @Override
+            public void onValue(int v) {
+                engine.drumLevel = v / 100f;
+                prefs.edit().putInt("pads", v).apply();
+            }
+        }), weight(1f));
+        row3.addView(label("Сайдчейн"));
+        row3.addView(slider(100, prefs.getInt("sidechain", 50), new SliderListener() {
+            @Override
+            public void onValue(int v) {
+                engine.sidechain = v / 100f;
+                prefs.edit().putInt("sidechain", v).apply();
+            }
+        }), weight(1f));
+        root.addView(row3);
+
         TextView help = new TextView(this);
         help.setTextColor(Color.rgb(150, 150, 165));
         help.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         help.setText("Тряхни — брейк (с доли до «раза») · наклон вбок — фильтр, экраном вниз — «под водой» · "
-                + "тап — бочка, второй палец — клэп · тяни вниз/вверх — темп · вбок — скретч · держи — луп · "
+                + "тап — бочка, второй палец — клэп · тяни вниз/вверх — темп (отпустил — сразу обратно) · "
+                + "вбок — скретч (ширина экрана = пол-доли, отпустил — трек в долю) · держи — луп · "
                 + "«1» — отметить первую долю, BPM — стучи темп начиная с «раза»");
         help.setPadding(dp(4), 0, dp(4), dp(4));
         root.addView(help);
@@ -264,6 +290,21 @@ public class MainActivity extends Activity implements SensorEventListener {
             public void onHoldEnd() {
                 engine.stopLoop();
             }
+
+            @Override
+            public void onScratchStart() {
+                engine.startScratch();
+            }
+
+            @Override
+            public void onScratchMove(double beats) {
+                engine.scratchBeats = beats;
+            }
+
+            @Override
+            public void onScratchEnd() {
+                engine.stopScratch();
+            }
         });
         root.addView(deck, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -280,6 +321,38 @@ public class MainActivity extends Activity implements SensorEventListener {
         Track t = engine.currentTrack();
         if (t != null) deck.title = t.name;
         refreshPlay();
+    }
+
+    private interface SliderListener {
+        void onValue(int v);
+    }
+
+    private SeekBar slider(int max, int value, final SliderListener l) {
+        SeekBar sb = new SeekBar(this);
+        sb.setMax(max);
+        sb.setProgress(value);
+        sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                if (fromUser) l.onValue(p);
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar s) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar s) {}
+        });
+        return sb;
+    }
+
+    private TextView label(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(Color.rgb(200, 200, 210));
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        t.setPadding(dp(6), 0, 0, 0);
+        return t;
     }
 
     private LinearLayout row() {

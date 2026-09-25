@@ -12,8 +12,8 @@ import android.view.View;
 
 /**
  * The "deck": a spinning record that visualizes playback and takes the gestures.
- * Tap = kick, extra finger = clap, vertical drag = tempo bend (returns on release),
- * horizontal drag = scratch, hold still = beat loop.
+ * Tap = kick, extra finger = clap, vertical drag = tempo bend (snaps back on release),
+ * horizontal drag = scratch (stroke length in beats, back on the beat on release), hold still = beat loop.
  */
 final class DeckView extends View {
     interface Callbacks {
@@ -27,6 +27,13 @@ final class DeckView extends View {
         void onHoldStart();
 
         void onHoldEnd();
+
+        void onScratchStart();
+
+        /** Record displacement in beats since the finger landed (negative = pulled back). */
+        void onScratchMove(double beats);
+
+        void onScratchEnd();
     }
 
     private static final int NONE = 0, BEND = 1, SCRATCH = 2, HOLD = 3;
@@ -43,9 +50,8 @@ final class DeckView extends View {
     float bpmShown = 120f;
 
     private int mode = NONE;
-    private float downX, downY, lastX;
-    private long downT, lastMoveT;
-    private float scratchVel;
+    private float downX, downY;
+    private long downT;
     private float bendAmount;
 
     DeckView(Context ctx, AudioEngine engine, Callbacks cb) {
@@ -181,11 +187,6 @@ final class DeckView extends View {
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
             cb.onHoldStart();
         }
-        if (mode == SCRATCH && now - lastMoveT > 40) {
-            // Finger is resting on the record: it stops.
-            scratchVel = 0;
-            cb.onSpeed(0f, 0.03f);
-        }
     }
 
     @Override
@@ -194,11 +195,10 @@ final class DeckView extends View {
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 MainActivity.unbuffered(this, e);
-                downX = lastX = e.getX();
+                downX = e.getX();
                 downY = e.getY();
-                downT = lastMoveT = now;
+                downT = now;
                 mode = NONE;
-                scratchVel = 0;
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
                 cb.onExtraFingerTap();
@@ -215,8 +215,7 @@ final class DeckView extends View {
                             mode = -1;
                         } else {
                             mode = Math.abs(dy) >= Math.abs(dx) ? BEND : SCRATCH;
-                            lastX = x;
-                            lastMoveT = now;
+                            if (mode == SCRATCH) cb.onScratchStart();
                         }
                     }
                 }
@@ -226,13 +225,8 @@ final class DeckView extends View {
                     float speed = bendAmount > 0 ? 1f - 0.6f * bendAmount : 1f - 0.5f * bendAmount;
                     cb.onSpeed(speed, 0.08f);
                 } else if (mode == SCRATCH) {
-                    long dt = Math.max(1, now - lastMoveT);
-                    float v = (x - lastX) / (dt / 1000f);
-                    scratchVel += (v - scratchVel) * 0.5f;
-                    // A quarter of the screen width per second equals normal speed.
-                    cb.onSpeed(Math.max(-6f, Math.min(6f, scratchVel / (getWidth() * 0.25f))), 0.02f);
-                    lastX = x;
-                    lastMoveT = now;
+                    // The record moves with the finger; stroke length is measured in beats, not seconds.
+                    cb.onScratchMove((x - downX) / getWidth() * AudioEngine.SCRATCH_BEATS_PER_WIDTH);
                 }
                 return true;
             }
@@ -240,8 +234,9 @@ final class DeckView extends View {
             case MotionEvent.ACTION_CANCEL: {
                 boolean tap = mode == NONE && now - downT < 300 && e.getActionMasked() == MotionEvent.ACTION_UP;
                 if (tap) cb.onDeckTap();
-                if (mode == BEND) cb.onSpeed(1f, 0.35f);
-                if (mode == SCRATCH) cb.onSpeed(1f, 0.05f);
+                // Snap straight back to the original tempo; a slow glide smears the groove.
+                if (mode == BEND) cb.onSpeed(1f, 0.004f);
+                if (mode == SCRATCH) cb.onScratchEnd();
                 if (mode == HOLD) cb.onHoldEnd();
                 mode = NONE;
                 downT = 0;

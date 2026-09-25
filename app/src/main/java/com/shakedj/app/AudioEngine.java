@@ -25,14 +25,20 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * fields and commands queued with {@link #post(Runnable)}.
  */
 final class AudioEngine {
-    static final int FX_NONE = -1, FX_ROLL = 0, FX_DROP = 1, FX_STOP = 2, FX_SPIN = 3, FX_LOOP = 4, FX_FILL = 5;
+    static final int FX_NONE = -1, FX_ROLL = 0, FX_DROP = 1, FX_STOP = 2, FX_SPIN = 3, FX_LOOP = 4, FX_FILL = 5,
+            FX_SCRATCH = 6;
     static final int BREAK_TYPES = 4;
-    static final String[] FX_NAMES = {"РОЛЛ", "ДРОП", "СТОП", "СПИН", "ЛУП", "ФИЛЛ"};
+    static final String[] FX_NAMES = {"РОЛЛ", "ДРОП", "СТОП", "СПИН", "ЛУП", "ФИЛЛ", "СКРЕТЧ"};
+    /** A full-width scratch stroke moves the record by this many beats. */
+    static final double SCRATCH_BEATS_PER_WIDTH = 0.5;
 
     private static final int MAX_VOICES = 24;
     private static final int MAX_EVENTS = 128;
     private static final int HISTORY = 512;
-    private static final float TRACK_LEVEL = 0.85f;
+    private static final float TRACK_LEVEL = 0.75f;
+    private static final float LIMIT = 0.95f;
+    /** How hard each drum pushes the sidechain (kick fully, hats barely). */
+    private static final float[] SIDECHAIN_KEY = {1f, 0.7f, 0.7f, 0.15f, 0.3f, 0.5f, 0.4f};
     private static final float FILTER_K = 0.8f;
 
     final int sampleRate;
@@ -54,7 +60,11 @@ final class AudioEngine {
     volatile float filterTarget;
     volatile float speedTarget = 1f;
     volatile float speedGlideSec = 0.1f;
-    volatile float drumLevel = 0.9f;
+    volatile float drumLevel = 1.2f;
+    /** 0..1: how deep drum hits duck the track. The track recovers over half a beat. */
+    volatile float sidechain = 0.5f;
+    /** Scratch stroke in beats from where the finger landed; written by the UI while scratching. */
+    volatile double scratchBeats;
 
     // Readouts for the UI.
     volatile double positionSec;
@@ -85,6 +95,8 @@ final class AudioEngine {
     private int fadeIn;
     private final int fadeLen;
     private float famt, ic1l, ic2l, ic1r, ic2r;
+    private float scKey, scDuck, limGain = 1f;
+    private double scratchPos;
 
     // Beat grids.
     private boolean trackGrid;
@@ -371,6 +383,36 @@ final class AudioEngine {
         });
     }
 
+    /** Finger lands on the record: it stops under the finger, the timeline keeps running (slip). */
+    void startScratch() {
+        scratchBeats = 0;
+        post(new Runnable() {
+            @Override
+            public void run() {
+                if (fx != FX_NONE || track == null || !playing) return;
+                pendingFx = FX_NONE;
+                fx = FX_SCRATCH;
+                fxStart = clock;
+                fxLen = Long.MAX_VALUE;
+                fxBeat = beatFrames();
+                fxAnchor = pos;
+                slipPos = pos;
+                scratchPos = pos;
+                publishFx(FX_SCRATCH);
+            }
+        });
+    }
+
+    /** Finger lifted: the track drops back in exactly where it would have been, so it stays on the beat. */
+    void stopScratch() {
+        post(new Runnable() {
+            @Override
+            public void run() {
+                if (fx == FX_SCRATCH) endFx();
+            }
+        });
+    }
+
     void stopLoop() {
         post(new Runnable() {
             @Override
@@ -624,6 +666,7 @@ final class AudioEngine {
             if (oldest < 0 || vPos[v] > vPos[oldest]) oldest = v;
         }
         if (slot < 0) slot = oldest;
+        scKey = Math.max(scKey, SIDECHAIN_KEY[drum] * Math.min(1f, gain));
         float pan = DrumKit.PAN[drum];
         vSmp[slot] = kit[drum];
         vPos[slot] = 0;
@@ -665,6 +708,14 @@ final class AudioEngine {
         int avail = t != null ? t.decodedFrames : 0;
         float dl = drumLevel;
         short[] d = t != null ? t.data : null;
+        float scDepth = 0.85f * Math.max(0f, Math.min(1f, sidechain));
+        // Duck release: down to 5% of the duck within half a beat, so the pump breathes in tempo.
+        float scRelease = (float) Math.exp(Math.log(0.05) / (0.5 * beatFrames()));
+        float scAttack = (float) (1 - Math.exp(-1.0 / (0.003 * sampleRate)));
+        float limRelease = (float) (1 - Math.exp(-1.0 / (0.08 * sampleRate)));
+        double scratchTarget = fx == FX_SCRATCH
+                ? fxAnchor + scratchBeats * beatFrames() * ratio : 0;
+        float scratchCoef = (float) (1 - Math.exp(-1.0 / (0.006 * sampleRate)));
 
         for (int i = 0; i < n; i++) {
             while (evN > 0 && evT[0] <= clock) popEvent();
@@ -709,6 +760,13 @@ final class AudioEngine {
                             gain = edge(loc, sl);
                             break;
                         }
+                        case FX_SCRATCH: {
+                            // The record follows the finger smoothly (no zipper noise from touch steps).
+                            scratchPos += (scratchTarget - scratchPos) * scratchCoef;
+                            if (scratchPos < 0) scratchPos = 0;
+                            rp = scratchPos;
+                            break;
+                        }
                         case FX_LOOP: {
                             double loc = (m + loopPhase) % b;
                             rp = fxAnchor + loc * ratio;
@@ -748,7 +806,7 @@ final class AudioEngine {
                     if (i0 + 1 < avail) {
                         float fr = (float) (rp - i0);
                         int k = i0 * 2;
-                        float s = gain * TRACK_LEVEL / 32768f;
+                        float s = gain * TRACK_LEVEL * (1f - scDepth * scDuck) / 32768f;
                         l = (d[k] + (d[k + 2] - d[k]) * fr) * s;
                         r = (d[k + 1] + (d[k + 3] - d[k + 1]) * fr) * s;
                     }
@@ -783,8 +841,18 @@ final class AudioEngine {
                 else vPos[v] = p;
             }
 
-            buf[2 * i] = softClip(l + dL * dl);
-            buf[2 * i + 1] = softClip(r + dR * dl);
+            // Sidechain envelope: fast attack towards the key, release in tempo.
+            if (scKey > scDuck) scDuck += (scKey - scDuck) * scAttack;
+            else scDuck = scKey;
+            scKey *= scRelease;
+
+            // Peak limiter so loud pads get louder without crackling; the clamp is only a safety net.
+            float oL = l + dL * dl, oR = r + dR * dl;
+            float peak = Math.max(Math.abs(oL), Math.abs(oR)) * limGain;
+            if (peak > LIMIT) limGain *= LIMIT / peak;
+            else limGain += (1f - limGain) * limRelease;
+            buf[2 * i] = clamp(oL * limGain);
+            buf[2 * i + 1] = clamp(oR * limGain);
             clock++;
         }
 
@@ -812,11 +880,7 @@ final class AudioEngine {
         beatNow = beats;
     }
 
-    /** Cubic soft clipper with unity small-signal gain; saturates smoothly at ±1.5 input. */
-    private static float softClip(float x) {
-        x *= 0.6666667f;
-        if (x > 1f) x = 1f;
-        else if (x < -1f) x = -1f;
-        return x * (1.5f - 0.5f * x * x);
+    private static float clamp(float x) {
+        return x > 1f ? 1f : x < -1f ? -1f : x;
     }
 }
