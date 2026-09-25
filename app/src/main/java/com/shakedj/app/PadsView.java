@@ -40,6 +40,7 @@ final class PadsView extends View {
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         int a = e.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN) MainActivity.unbuffered(this, e);
         if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
             int idx = e.getActionIndex();
             int pad = padAt(e.getX(idx), e.getY(idx));

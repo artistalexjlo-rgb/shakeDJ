@@ -18,7 +18,8 @@ final class TrackDecoder {
         /** Called as soon as the first audio is decoded; playback can start right away. */
         void onReady(Track track);
 
-        void onComplete(Track track, float bpm);
+        /** Tempo and the position of a downbeat ("one"); bpm is 0 if it couldn't be detected. */
+        void onComplete(Track track, float bpm, double downbeatSec);
 
         void onError(String message);
     }
@@ -119,7 +120,8 @@ final class TrackDecoder {
             }
             if (track != null && !cancelled) {
                 track.complete = true;
-                listener.onComplete(track, estimateBpm(track));
+                double[] grid = estimateGrid(track);
+                listener.onComplete(track, (float) grid[0], grid[1]);
             }
         } finally {
             if (codec != null) {
@@ -171,32 +173,43 @@ final class TrackDecoder {
         return (short) Math.max(-32768, Math.min(32767, s));
     }
 
-    /** Tempo from the autocorrelation of an onset envelope (first two minutes of the track). */
-    static float estimateBpm(Track t) {
+    /** How many hops the detected onset peak runs ahead of the audible attack, given the window. */
+    private static final double ONSET_DELAY_HOPS = 4; // measured on synthetic tracks: ~20 ms
+
+    /**
+     * Beat grid of the track (first two minutes are analysed): {bpm, downbeatSec}, or {0, 0}.
+     * Tempo comes from the autocorrelation of an onset envelope, the beat phase from the offset
+     * that best lines up with onsets, and the "one" from the beat of the bar with the strongest
+     * bass attacks. The user can re-mark the "one" in the app if the guess is wrong.
+     */
+    static double[] estimateGrid(Track t) {
         int rate = t.sampleRate;
         int hop = Math.max(1, rate / 200); // 5 ms
         int frames = Math.min(t.decodedFrames, rate * 120);
         int win = 5; // 25 ms windows, so the rectified bass doesn't ripple the envelope
         int nh = frames / hop - win;
-        if (nh < 800) return 0f;
+        if (nh < 800) return new double[]{0, 0};
         long[] hopSum = new long[nh + win];
+        double[] bassSum = new double[nh + win];
         short[] d = t.data;
+        double lpA = 1 - Math.exp(-2 * Math.PI * 120.0 / rate), lp = 0;
         for (int h = 0; h < nh + win; h++) {
             long sum = 0;
+            double bass = 0;
             int base = h * hop * 2;
-            for (int j = 0; j < hop * 2; j++) sum += Math.abs(d[base + j]);
+            for (int j = 0; j < hop; j++) {
+                int l = d[base + 2 * j], r = d[base + 2 * j + 1];
+                sum += Math.abs(l) + Math.abs(r);
+                lp += lpA * ((l + r) - lp);
+                bass += Math.abs(lp);
+            }
             hopSum[h] = sum;
+            bassSum[h] = bass;
         }
-        float[] env = new float[nh];
-        for (int h = 0; h < nh; h++) {
-            long sum = 0;
-            for (int j = 0; j < win; j++) sum += hopSum[h + j];
-            env[h] = (float) Math.log1p(sum / (double) (hop * win) / 100.0);
-        }
-        float[] diff = new float[nh];
-        for (int h = 1; h < nh; h++) diff[h] = Math.max(0f, env[h] - env[h - 1]);
-        float[] onset = new float[nh];
-        for (int h = 1; h + 1 < nh; h++) onset[h] = 0.25f * diff[h - 1] + 0.5f * diff[h] + 0.25f * diff[h + 1];
+        double[] all = new double[nh + win];
+        for (int h = 0; h < nh + win; h++) all[h] = hopSum[h];
+        float[] onset = onsets(all, nh, win, hop);
+        float[] bassOnset = onsets(bassSum, nh, win, hop);
 
         int minLag = 200 * 60 / 185, maxLag = 200 * 60 / 65;
         double[] raw = new double[maxLag + 2];
@@ -227,6 +240,51 @@ final class TrackDecoder {
         double bpm = 60.0 * rate / hop / lag;
         while (bpm < 80) bpm *= 2;
         while (bpm > 180) bpm /= 2;
-        return (float) (Math.round(bpm * 10) / 10.0);
+        bpm = Math.round(bpm * 10) / 10.0;
+
+        // Beat phase: the offset whose comb of beats collects the most onset energy.
+        double period = 60.0 * rate / hop / bpm;
+        int phase = 0;
+        double phaseScore = -1;
+        for (int o = 0; o < (int) Math.ceil(period); o++) {
+            double s = 0;
+            for (double x = o; x < nh - 1; x += period) s += onset[(int) Math.round(x)];
+            if (s > phaseScore) {
+                phaseScore = s;
+                phase = o;
+            }
+        }
+        // Downbeat: which of the four beats gets the heaviest bass attacks.
+        int one = 0;
+        double oneScore = -1;
+        for (int j = 0; j < 4; j++) {
+            double s = 0;
+            for (double x = phase + j * period; x < nh - 1; x += 4 * period) {
+                int i = (int) Math.round(x);
+                s += bassOnset[i] + 0.5 * onset[i];
+            }
+            if (s > oneScore) {
+                oneScore = s;
+                one = j;
+            }
+        }
+        double downbeatHop = phase + one * period + ONSET_DELAY_HOPS;
+        return new double[]{bpm, downbeatHop * hop / rate};
+    }
+
+
+    /** Positive, lightly smoothed slope of the log energy over sliding windows of {@code win} hops. */
+    private static float[] onsets(double[] hopSums, int nh, int win, int hop) {
+        float[] env = new float[nh];
+        for (int h = 0; h < nh; h++) {
+            double sum = 0;
+            for (int j = 0; j < win; j++) sum += hopSums[h + j];
+            env[h] = (float) Math.log1p(sum / (hop * win) / 100.0);
+        }
+        float[] diff = new float[nh];
+        for (int h = 1; h < nh; h++) diff[h] = Math.max(0f, env[h] - env[h - 1]);
+        float[] onset = new float[nh];
+        for (int h = 1; h + 1 < nh; h++) onset[h] = 0.25f * diff[h - 1] + 0.5f * diff[h] + 0.25f * diff[h + 1];
+        return onset;
     }
 }

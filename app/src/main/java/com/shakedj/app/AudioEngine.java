@@ -4,6 +4,7 @@ import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioTimestamp;
 import android.media.AudioTrack;
 import android.os.Process;
 
@@ -13,6 +14,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * Real-time mixer: plays the loaded track with varispeed, DJ filter and break effects,
  * and layers synthesized drums on top. Without a track it only plays drums, which mix
  * with whatever other app (a streaming service) is playing.
+ *
+ * Breaks are quantized to a beat grid: they start on the next beat and hand back to the
+ * track exactly on the next "one" of a bar. The grid lives in track time when a track
+ * plays (auto-detected or set by the user) and in engine-clock time otherwise (set by
+ * tapping the tempo), so fills over a streaming app can land on the one too.
  *
  * All render state is owned by the audio thread; the UI talks to it through volatile
  * fields and commands queued with {@link #post(Runnable)}.
@@ -24,11 +30,12 @@ final class AudioEngine {
 
     private static final int MAX_VOICES = 24;
     private static final int MAX_EVENTS = 128;
+    private static final int HISTORY = 512;
     private static final float TRACK_LEVEL = 0.85f;
     private static final float FILTER_K = 0.8f;
 
     final int sampleRate;
-    private final int blockFrames;
+    private final int burst;
     private final AudioTrack out;
     private final float[][] kit;
     private final ConcurrentLinkedQueue<Runnable> commands = new ConcurrentLinkedQueue<Runnable>();
@@ -49,6 +56,9 @@ final class AudioEngine {
     volatile float filterNow;
     volatile int fxNow = FX_NONE;
     volatile long fxStartedAtMs;
+    /** Beats since a downbeat at the moment that is audible now; NaN without a grid. */
+    volatile double beatNow = Double.NaN;
+    volatile int outputLatencyMs;
 
     // Audio-thread state.
     private volatile Track track;
@@ -58,9 +68,26 @@ final class AudioEngine {
     private long clock;
     private int fx = FX_NONE;
     private long fxStart, fxLen;
-    private double fxAnchor, slipPos, fxBeat;
-    private int fadeIn, fadeLen;
+    private int fxBeats;
+    private double fxAnchor, slipPos, fxBeat, loopPhase;
+    private int pendingFx = FX_NONE, pendingBeats, pendingBarBeat;
+    private double pendingPos;
+    private int fadeIn;
+    private final int fadeLen;
     private float famt, ic1l, ic2l, ic1r, ic2r;
+
+    // Beat grids.
+    private boolean trackGrid;
+    private double gridOffsetSec;
+    private boolean clockGrid;
+    private long clockGridOffset;
+
+    // Output timing: which rendered frame is audible when, and where the track timeline was.
+    private final AudioTimestamp ts = new AudioTimestamp();
+    private long tsFrame = -1, tsNanos;
+    private final long[] hClock = new long[HISTORY];
+    private final double[] hPos = new double[HISTORY];
+    private int hCount;
 
     private final float[][] vSmp = new float[MAX_VOICES][];
     private final int[] vPos = new int[MAX_VOICES];
@@ -76,8 +103,7 @@ final class AudioEngine {
     AudioEngine(Context ctx) {
         AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
         sampleRate = parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE), 48000);
-        int burst = parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER), 256);
-        blockFrames = Math.max(64, Math.min(burst, 512));
+        burst = Math.max(32, Math.min(parseOr(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER), 192), 2048));
         kit = DrumKit.build(sampleRate);
 
         int minBytes = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO,
@@ -92,10 +118,13 @@ final class AudioEngine {
                         .setSampleRate(sampleRate)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                         .build())
-                .setBufferSizeInBytes(Math.max(minBytes, blockFrames * 4 * 2 * 4))
+                // Capacity leaves room for the latency tuner to grow into.
+                .setBufferSizeInBytes(Math.max(minBytes, burst * 8 * 8))
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
+        // Blocking writes keep the buffer full, so its fill level *is* the latency: start at two bursts.
+        out.setBufferSizeInFrames(burst * 2);
         fadeLen = (int) (0.004 * sampleRate);
     }
 
@@ -149,8 +178,46 @@ final class AudioEngine {
                 pos = 0;
                 lastReadPos = 0;
                 fx = FX_NONE;
+                pendingFx = FX_NONE;
                 fxNow = FX_NONE;
                 speed = 1f;
+                trackGrid = false;
+                hCount = 0;
+            }
+        });
+    }
+
+    /** Beat grid of the track: {@code downbeatSec} is the position of any "one". */
+    void setTrackGrid(final Track t, final double downbeatSec) {
+        post(new Runnable() {
+            @Override
+            public void run() {
+                if (track != t) return;
+                trackGrid = true;
+                gridOffsetSec = downbeatSec;
+            }
+        });
+    }
+
+    /**
+     * The user marked a downbeat at {@code nanoTime} (System.nanoTime / CLOCK_MONOTONIC).
+     * Anchors the clock grid and, when a track is playing, the track grid too.
+     */
+    void markDownbeat(final long nanoTime) {
+        post(new Runnable() {
+            @Override
+            public void run() {
+                long heard = heardClock(nanoTime);
+                clockGrid = true;
+                clockGridOffset = heard;
+                Track t = track;
+                if (t != null && playing) {
+                    double p = timelineAt(heard);
+                    if (!Double.isNaN(p)) {
+                        trackGrid = true;
+                        gridOffsetSec = p / t.sampleRate;
+                    }
+                }
             }
         });
     }
@@ -161,8 +228,11 @@ final class AudioEngine {
             public void run() {
                 if (track == null) return;
                 pos = Math.max(0, sec * track.sampleRate);
+                pendingFx = FX_NONE;
                 if (fx != FX_NONE) endFx();
+                fxNow = FX_NONE;
                 fadeIn = fadeLen;
+                hCount = 0;
             }
         });
     }
@@ -176,12 +246,12 @@ final class AudioEngine {
         });
     }
 
-    /** Shake gesture. Returns immediately; the effect label shows up in {@link #fxNow}. */
+    /** Shake gesture. The break starts on the next beat and ends on the next downbeat. */
     void triggerBreak(final int type) {
         post(new Runnable() {
             @Override
             public void run() {
-                startFx(type);
+                requestFx(type);
             }
         });
     }
@@ -190,7 +260,7 @@ final class AudioEngine {
         post(new Runnable() {
             @Override
             public void run() {
-                if (fx == FX_NONE && track != null && playing) startFx(FX_LOOP);
+                if (fx == FX_NONE && pendingFx == FX_NONE && track != null && playing) startLoopNow();
             }
         });
     }
@@ -208,68 +278,146 @@ final class AudioEngine {
 
     private void loop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        float[] buf = new float[blockFrames * 2];
+        float[] buf = new float[burst * 2];
         out.play();
+        int blocks = 0, underruns = 0;
         while (running) {
             Runnable r;
             while ((r = commands.poll()) != null) r.run();
-            render(buf, blockFrames);
+            render(buf, burst);
             out.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
+            if ((++blocks & 15) == 0) {
+                if (out.getTimestamp(ts)) {
+                    tsFrame = ts.framePosition;
+                    tsNanos = ts.nanoTime;
+                }
+                // Latency tuner: grow the buffer one burst at a time only if the device glitches.
+                int u = out.getUnderrunCount();
+                if (u > underruns) {
+                    underruns = u;
+                    int size = out.getBufferSizeInFrames();
+                    if (size + burst <= out.getBufferCapacityInFrames()) out.setBufferSizeInFrames(size + burst);
+                }
+            }
         }
         out.pause();
         out.flush();
         out.stop();
     }
 
-    private void startFx(int type) {
+    /** Engine-clock frame that is (or was) coming out of the speaker at {@code nanoTime}. */
+    private long heardClock(long nanoTime) {
+        if (tsFrame >= 0) return tsFrame + (long) ((nanoTime - tsNanos) * (double) sampleRate / 1e9);
+        return clock - out.getBufferSizeInFrames();
+    }
+
+    /** Track timeline position (ignoring effects) at engine-clock frame {@code c}; NaN if unknown. */
+    private double timelineAt(long c) {
+        if (hCount == 0) return Double.NaN;
+        int newest = (hCount - 1) % HISTORY;
+        if (c >= hClock[newest]) return hPos[newest];
+        int oldest = hCount > HISTORY ? hCount - HISTORY : 0;
+        for (int n = hCount - 1; n > oldest; n--) {
+            int i = n % HISTORY, j = (n - 1) % HISTORY;
+            if (hClock[j] <= c) {
+                double f = (c - hClock[j]) / (double) (hClock[i] - hClock[j]);
+                return hPos[j] + (hPos[i] - hPos[j]) * f;
+            }
+        }
+        return Double.NaN;
+    }
+
+    private double beatFrames() {
+        return 60.0 / Math.max(40f, Math.min(bpm, 240f)) * sampleRate;
+    }
+
+    /** Beats until the next downbeat when starting at bar position {@code barBeat}; at least two. */
+    private static int beatsToOne(int barBeat) {
+        int n = 4 - barBeat;
+        return n < 2 ? n + 4 : n;
+    }
+
+    private void requestFx(int type) {
+        if (fx != FX_NONE || pendingFx != FX_NONE) return;
         Track t = track;
-        double beat = 60.0 / Math.max(40f, Math.min(bpm, 240f)) * sampleRate;
+        double beat = beatFrames();
         if (t == null || !playing) {
-            // Nothing of ours is playing (e.g. overlaying a streaming app): answer with a drum fill.
-            if (fx != FX_NONE) return;
+            // Nothing of ours is playing (e.g. overlaying a streaming app): answer with a drum fill,
+            // on the tapped grid if there is one.
+            long start = clock;
+            int barBeat = 0, beats = 4;
+            if (clockGrid) {
+                long nb = (long) Math.ceil((clock - clockGridOffset) / beat);
+                start = clockGridOffset + Math.round(nb * beat);
+                barBeat = (int) Math.floorMod(nb, 4L);
+                beats = beatsToOne(barBeat);
+            }
             fx = FX_FILL;
-            fxStart = clock;
-            fxLen = (long) (4 * beat);
-            scheduleFill(clock, beat);
-            schedule(clock + fxLen, DrumKit.KICK, 1f);
-            schedule(clock + fxLen, DrumKit.CRASH, 1f);
-            publishFx();
+            fxStart = start;
+            fxLen = Math.round(beats * beat);
+            scheduleFill(start, beat, barBeat, beats);
+            scheduleReturn(start + fxLen);
+            publishFx(FX_FILL);
             return;
         }
-        if (fx != FX_NONE) return;
+        if (trackGrid) {
+            double beatT = beat * t.sampleRate / sampleRate;
+            double off = gridOffsetSec * t.sampleRate;
+            long nb = (long) Math.ceil((pos - off) / beatT);
+            pendingFx = type;
+            pendingPos = off + nb * beatT;
+            pendingBarBeat = (int) Math.floorMod(nb, 4L);
+            pendingBeats = beatsToOne(pendingBarBeat);
+        } else {
+            beginFx(type, pos, 4, 0, clock);
+        }
+        publishFx(type);
+    }
+
+    private void beginFx(int type, double anchor, int beats, int barBeat, long start) {
         fx = type;
-        fxStart = clock;
-        fxBeat = beat;
-        fxAnchor = pos;
+        fxStart = start;
+        fxBeat = beatFrames();
+        fxBeats = beats;
+        fxAnchor = anchor;
         slipPos = pos;
+        fxLen = Math.round(beats * fxBeat);
         switch (type) {
-            case FX_ROLL:
-                fxLen = (long) (3 * beat);
-                break;
             case FX_DROP:
-                fxLen = (long) (4 * beat);
-                scheduleFill(clock, beat);
+                scheduleFill(start, fxBeat, barBeat, beats);
                 break;
             case FX_STOP:
             case FX_SPIN:
-                fxLen = (long) (2 * beat);
-                break;
-            case FX_LOOP:
-                fxLen = Long.MAX_VALUE;
+                scheduleRoll(start + Math.round((beats - 1) * fxBeat), fxBeat);
                 break;
             default:
-                fx = FX_NONE;
-                return;
+                break;
         }
-        if (type != FX_LOOP) {
-            schedule(clock + fxLen, DrumKit.KICK, 1f);
-            schedule(clock + fxLen, DrumKit.CRASH, 0.9f);
-        }
-        publishFx();
+        scheduleReturn(start + fxLen);
     }
 
-    private void publishFx() {
-        fxNow = fx;
+    /** Hold-to-loop: loops the current beat, starting seamlessly from where the track is now. */
+    private void startLoopNow() {
+        Track t = track;
+        double ratio = (double) t.sampleRate / sampleRate;
+        fx = FX_LOOP;
+        fxStart = clock;
+        fxBeat = beatFrames();
+        fxLen = Long.MAX_VALUE;
+        slipPos = pos;
+        if (trackGrid) {
+            double beatT = fxBeat * ratio;
+            double off = gridOffsetSec * t.sampleRate;
+            fxAnchor = off + Math.floor((pos - off) / beatT) * beatT;
+        } else {
+            fxAnchor = pos;
+        }
+        loopPhase = (pos - fxAnchor) / ratio;
+        publishFx(FX_LOOP);
+    }
+
+    private void publishFx(int type) {
+        fxNow = type;
         fxStartedAtMs = System.currentTimeMillis();
     }
 
@@ -283,18 +431,39 @@ final class AudioEngine {
         speed = speedTarget;
     }
 
-    /** One bar of drums on a 16th-note grid: kick pattern, backbeat, then a snare roll. */
-    private void scheduleFill(long start, double beat) {
+    /**
+     * Drums over {@code beats} beats starting at bar position {@code barBeat}, on a 16th grid:
+     * a groove, then a snare roll on the last beat leading into the downbeat.
+     */
+    private void scheduleFill(long start, double beat, int barBeat, int beats) {
         double step = beat / 4;
-        int[] kicks = {0, 3, 8, 10};
-        for (int s : kicks) schedule(start + (long) (s * step), DrumKit.KICK, 1f);
-        schedule(start + (long) (4 * step), DrumKit.SNARE, 0.9f);
-        schedule(start + (long) (12 * step), DrumKit.CLAP, 0.8f);
-        for (int s = 0; s < 12; s += 2) schedule(start + (long) (s * step), DrumKit.HAT, s % 4 == 0 ? 0.9f : 0.6f);
-        schedule(start + (long) (13 * step), DrumKit.SNARE, 0.55f);
-        schedule(start + (long) (14 * step), DrumKit.SNARE, 0.7f);
-        schedule(start + (long) (15 * step), DrumKit.SNARE, 0.9f);
-        schedule(start + (long) (14 * step), DrumKit.PERC, 0.6f);
+        for (int k = 0; k < beats; k++) {
+            long base = start + Math.round(k * beat);
+            if (k == beats - 1) {
+                scheduleRoll(base, beat);
+                continue;
+            }
+            int bb = (barBeat + k) % 4;
+            for (int j = 0; j < 4; j++) {
+                int s = bb * 4 + j;
+                long at = base + Math.round(j * step);
+                if (s == 0 || s == 3 || s == 8 || s == 10) schedule(at, DrumKit.KICK, 1f);
+                if (s == 4) schedule(at, DrumKit.SNARE, 0.9f);
+                if (s == 12) schedule(at, DrumKit.CLAP, 0.85f);
+                if (j % 2 == 0) schedule(at, DrumKit.HAT, j == 0 ? 0.9f : 0.6f);
+            }
+        }
+    }
+
+    private void scheduleRoll(long start, double beat) {
+        float[] gains = {0.45f, 0.6f, 0.75f, 0.95f};
+        for (int j = 0; j < 4; j++) schedule(start + Math.round(j * beat / 4), DrumKit.SNARE, gains[j]);
+        schedule(start + Math.round(beat / 2), DrumKit.PERC, 0.6f);
+    }
+
+    private void scheduleReturn(long at) {
+        schedule(at, DrumKit.KICK, 1f);
+        schedule(at, DrumKit.CRASH, 0.9f);
     }
 
     private void schedule(long t, int drum, float gain) {
@@ -395,30 +564,38 @@ final class AudioEngine {
                             playing = false;
                             play = false;
                             pos = 0;
+                            pendingFx = FX_NONE;
                         } else {
                             pos = Math.max(0, avail - 1);
                         }
                     }
+                    if (pendingFx != FX_NONE && pos >= pendingPos) {
+                        int type = pendingFx;
+                        pendingFx = FX_NONE;
+                        beginFx(type, pendingPos, pendingBeats, pendingBarBeat, clock + 1);
+                    }
                 } else {
                     slipPos += ratio;
                     double m = clock - fxStart;
+                    if (m < 0) m = 0;
                     double b = fxBeat;
                     switch (fx) {
                         case FX_ROLL: {
-                            double sl, st;
-                            if (m < b) { sl = b / 2; st = 0; }
-                            else if (m < 2 * b) { sl = b / 4; st = b; }
-                            else if (m < 2.5 * b) { sl = b / 8; st = 2 * b; }
-                            else { sl = b / 16; st = 2.5 * b; }
-                            double loc = (m - st) % sl;
+                            // Slices get shorter as the downbeat approaches: 1/2, 1/4, 1/8, 1/16 beat.
+                            double left = fxBeats - m / b;
+                            double sl = left > 2 ? b / 2 : left > 1 ? b / 4 : left > 0.5 ? b / 8 : b / 16;
+                            double loc = m % sl;
                             rp = fxAnchor + loc * ratio;
                             gain = edge(loc, sl);
                             break;
                         }
                         case FX_LOOP: {
-                            double loc = m % b;
+                            double loc = (m + loopPhase) % b;
                             rp = fxAnchor + loc * ratio;
-                            gain = edge(loc, b);
+                            // No fade-in on the first pass: it continues seamlessly from the track.
+                            gain = m + loopPhase < b
+                                    ? (float) Math.min(1, (b - loc) / (0.002 * sampleRate))
+                                    : edge(loc, b);
                             break;
                         }
                         case FX_DROP: {
@@ -427,8 +604,9 @@ final class AudioEngine {
                             break;
                         }
                         case FX_STOP: {
-                            double y = 1 - Math.min(1, m / b);
-                            rp = fxAnchor + ratio * b * (1 - y * y * y) / 3.0;
+                            double len = (fxBeats >= 3 ? 2 : 1) * b;
+                            double y = 1 - Math.min(1, m / len);
+                            rp = fxAnchor + ratio * len * (1 - y * y * y) / 3.0;
                             gain = (float) Math.min(1, y * 6);
                             break;
                         }
@@ -490,8 +668,28 @@ final class AudioEngine {
             clock++;
         }
 
-        if (t != null) positionSec = lastReadPos / t.sampleRate;
+        if (t != null) {
+            positionSec = lastReadPos / t.sampleRate;
+            int h = hCount % HISTORY;
+            hClock[h] = clock;
+            hPos[h] = fx == FX_NONE || fx == FX_FILL ? pos : slipPos;
+            hCount++;
+        }
         speedNow = speed;
+        publishBeat(t);
+    }
+
+    private void publishBeat(Track t) {
+        long heard = heardClock(System.nanoTime());
+        outputLatencyMs = (int) Math.max(0, (clock - heard) * 1000L / sampleRate);
+        double beats = Double.NaN;
+        if (t != null && playing && trackGrid) {
+            double p = timelineAt(heard);
+            if (!Double.isNaN(p)) beats = (p / t.sampleRate - gridOffsetSec) * bpm / 60.0;
+        } else if (clockGrid) {
+            beats = (heard - clockGridOffset) / beatFrames();
+        }
+        beatNow = beats;
     }
 
     /** Cubic soft clipper with unity small-signal gain; saturates smoothly at ±1.5 input. */

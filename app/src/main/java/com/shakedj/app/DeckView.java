@@ -102,6 +102,31 @@ final class DeckView extends View {
         String time = t != null ? fmt(engine.positionSec) + " / " + fmt(t.durationSec()) : "режим поверх стриминга";
         c.drawText(time + "   ·   " + String.format("%.1f", bpmShown) + " BPM", cx, 46 * dp, paint);
 
+        // Beat grid: four dots, the "one" in accent colour, the current beat lit.
+        double beat = engine.beatNow;
+        float dotY = 64 * dp, gap = 18 * dp;
+        for (int i = 0; i < 4; i++) {
+            float x = cx + (i - 1.5f) * gap;
+            boolean lit = false;
+            float glow = 0f;
+            if (!Double.isNaN(beat)) {
+                double b = Math.floor(beat);
+                lit = ((int) (b - 4 * Math.floor(b / 4))) == i;
+                glow = (float) (1 - (beat - b));
+            }
+            int base = i == 0 ? Color.rgb(255, 90, 60) : Color.rgb(230, 230, 235);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(lit ? base : Color.rgb(55, 55, 65));
+            paint.setAlpha(lit ? (int) (120 + 135 * glow) : 255);
+            c.drawCircle(x, dotY, (lit ? 4.5f : 3.5f) * dp, paint);
+        }
+        paint.setAlpha(255);
+        paint.setTextSize(11 * dp);
+        paint.setColor(Color.rgb(110, 110, 125));
+        paint.setTextAlign(Paint.Align.RIGHT);
+        c.drawText("вывод ~" + engine.outputLatencyMs + " мс", w - 10 * dp, dotY + 4 * dp, paint);
+        paint.setTextAlign(Paint.Align.CENTER);
+
         float sp = engine.speedNow;
         if (Math.abs(sp - 1f) > 0.01f) {
             paint.setColor(Color.WHITE);
@@ -164,6 +189,7 @@ final class DeckView extends View {
         long now = SystemClock.uptimeMillis();
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                MainActivity.unbuffered(this, e);
                 downX = lastX = e.getX();
                 downY = e.getY();
                 downT = lastMoveT = now;

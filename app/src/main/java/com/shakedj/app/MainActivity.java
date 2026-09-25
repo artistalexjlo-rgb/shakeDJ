@@ -17,6 +17,7 @@ import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.util.TypedValue;
 import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
@@ -60,6 +61,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private int breakMode = -1;
     private int autoBreak;
     private float trackBpm;
+    private double trackDownbeatSec;
     private boolean userBpm;
     private final long[] taps = new long[5];
     private int tapCount;
@@ -129,19 +131,39 @@ public class MainActivity extends Activity implements SensorEventListener {
             }
         });
         btnBpm = button("120 BPM");
-        btnBpm.setOnClickListener(new View.OnClickListener() {
+        // Taps are timed on touch-down with the event's own timestamp, not on the later click.
+        btnBpm.setOnTouchListener(new View.OnTouchListener() {
             @Override
-            public void onClick(View v) {
-                tapTempo();
+            public boolean onTouch(View v, MotionEvent e) {
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    unbuffered(v, e);
+                    tapTempo(eventNanos(e));
+                }
+                return false;
             }
         });
         btnBpm.setOnLongClickListener(new View.OnLongClickListener() {
             @Override
             public boolean onLongClick(View v) {
                 userBpm = false;
+                tapCount = 0;
                 setBpm(trackBpm > 0 ? trackBpm : 120f);
-                toast("Темп сброшен на автоопределение");
+                Track t = engine.currentTrack();
+                if (t != null && trackBpm > 0) engine.setTrackGrid(t, trackDownbeatSec);
+                toast("Темп и сетка сброшены на автоопределение");
                 return true;
+            }
+        });
+        Button btnOne = button("1");
+        btnOne.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    unbuffered(v, e);
+                    engine.markDownbeat(eventNanos(e));
+                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                }
+                return false;
             }
         });
         btnBreak = button("Брейк: авто");
@@ -155,6 +177,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         row1.addView(btnOpen, weight(1f));
         row1.addView(btnPlay, weight(0.6f));
         row1.addView(btnBpm, weight(1f));
+        row1.addView(btnOne, weight(0.5f));
         row1.addView(btnBreak, weight(1.3f));
         root.addView(row1);
 
@@ -206,8 +229,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         TextView help = new TextView(this);
         help.setTextColor(Color.rgb(150, 150, 165));
         help.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
-        help.setText("Тряхни — брейк · наклон вбок — фильтр (экраном вниз — «под водой») · тап — бочка, "
-                + "второй палец — клэп · тяни вниз/вверх — темп · вбок — скретч · держи палец — луп");
+        help.setText("Тряхни — брейк (с доли до «раза») · наклон вбок — фильтр, экраном вниз — «под водой» · "
+                + "тап — бочка, второй палец — клэп · тяни вниз/вверх — темп · вбок — скретч · держи — луп · "
+                + "«1» — отметить первую долю, BPM — стучи темп начиная с «раза»");
         help.setPadding(dp(4), 0, dp(4), dp(4));
         root.addView(help);
 
@@ -317,21 +341,36 @@ public class MainActivity extends Activity implements SensorEventListener {
         btnBpm.setText(String.format("%.0f BPM", bpm));
     }
 
-    private void tapTempo() {
-        long now = SystemClock.uptimeMillis();
-        if (tapCount > 0 && now - taps[(tapCount - 1) % taps.length] > 2000) tapCount = 0;
-        taps[tapCount % taps.length] = now;
+    /**
+     * Tap tempo. The first tap of a series marks the "one" (start tapping on it), the following
+     * taps set the tempo, so the grid stays anchored to where the user started.
+     */
+    private void tapTempo(long nanos) {
+        if (tapCount > 0 && nanos - taps[(tapCount - 1) % taps.length] > 2_000_000_000L) tapCount = 0;
+        if (tapCount == 0) engine.markDownbeat(nanos);
+        taps[tapCount % taps.length] = nanos;
         tapCount++;
         int n = Math.min(tapCount, taps.length);
         if (n >= 2) {
             long first = taps[(tapCount - n) % taps.length];
-            float bpm = 60000f * (n - 1) / (now - first);
+            float bpm = 60e9f * (n - 1) / (nanos - first);
             if (bpm >= 50 && bpm <= 220) {
                 userBpm = true;
                 setBpm(bpm);
             }
         }
         engine.hit(DrumKit.HAT, 0.7f);
+    }
+
+    /** Touch-down time on the CLOCK_MONOTONIC timeline shared with System.nanoTime and audio timestamps. */
+    private static long eventNanos(MotionEvent e) {
+        if (Build.VERSION.SDK_INT >= 34) return e.getEventTimeNanos();
+        return e.getEventTime() * 1_000_000L;
+    }
+
+    /** Asks for this gesture's events without waiting for the next display frame. */
+    static void unbuffered(View v, MotionEvent e) {
+        if (Build.VERSION.SDK_INT >= 30) v.requestUnbufferedDispatch(e);
     }
 
     // ---- Tracks -----------------------------------------------------------------------------
@@ -388,18 +427,24 @@ public class MainActivity extends Activity implements SensorEventListener {
                         engine.playing = true;
                         deck.title = name;
                         trackBpm = 0;
+                        userBpm = false;
+                        tapCount = 0;
                     }
                 });
             }
 
             @Override
-            public void onComplete(final Track track, final float bpm) {
+            public void onComplete(final Track track, final float bpm, final double downbeatSec) {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
                         if (sDecoder != dec) return;
                         trackBpm = bpm;
-                        if (!userBpm && bpm > 0) setBpm(bpm);
+                        trackDownbeatSec = downbeatSec;
+                        if (!userBpm && bpm > 0) {
+                            setBpm(bpm);
+                            engine.setTrackGrid(track, downbeatSec);
+                        }
                         if (track.truncated) toast("Трек длиннее 10 минут — загружено начало");
                     }
                 });
