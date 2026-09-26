@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # SHA-256 of keystore/shakedj-sideload.jks. Every APK must carry it, or it won't install over
+  # the previous version on the phone.
+  SIGNING_CERT_SHA256: 1cad03c3e9ab28e8449ebb3d6d3a676720326c4345b078dc8a3da6e7664e689c
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,7 +26,17 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon
 
+      - name: Check signing key and name the APK by version
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          "$APKSIGNER" verify --print-certs "$APK" | tee certs.txt
+          grep -q "SHA-256 digest: $SIGNING_CERT_SHA256" certs.txt || { echo "::error::APK is not signed with the sideload key"; exit 1; }
+          VERSION=$(grep -oE 'versionName = "[^"]+"' app/build.gradle.kts | cut -d'"' -f2)
+          mkdir -p dist && cp "$APK" "dist/ShakeDJ-$VERSION.apk"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ShakeDJ-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: ShakeDJ-${{ env.VERSION }}
+          path: dist/*.apk

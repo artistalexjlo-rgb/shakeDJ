@@ -21,8 +21,8 @@ APKSIGNER="${APKSIGNER:-$(command -v apksigner || echo "$BT/apksigner")}"
 PKG=com.shakedj.app
 MIN_SDK=26
 TARGET_SDK=35
-VERSION_CODE="${VERSION_CODE:-7}"
-VERSION_NAME="${VERSION_NAME:-0.7}"
+VERSION_CODE="${VERSION_CODE:-8}"
+VERSION_NAME="${VERSION_NAME:-0.7.1}"
 
 SRC="$ROOT/app/src/main"
 OUT="$ROOT/build/manual"
@@ -78,7 +78,8 @@ cp "$OUT/base.apk" "$OUT/unsigned.apk"
 if [ -d "$OUT/native/lib" ]; then (cd "$OUT/native" && zip -qr "$OUT/unsigned.apk" lib); fi
 "$ZIPALIGN" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
-KS="${KEYSTORE:-$HOME/.android/debug.keystore}"
+# Same committed key as the Gradle build, so APKs from any build install over each other.
+KS="${KEYSTORE:-$ROOT/keystore/shakedj-sideload.jks}"
 if [ ! -f "$KS" ]; then
     mkdir -p "$(dirname "$KS")"
     keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \

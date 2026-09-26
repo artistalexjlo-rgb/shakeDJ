@@ -10,8 +10,8 @@ android {
         applicationId = "com.shakedj.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.7"
+        versionCode = 8
+        versionName = "0.7.1"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -24,11 +24,25 @@ android {
         }
     }
 
+    // One fixed key for every build (CI, local, the no-Gradle script), so each new APK installs
+    // over the previous one. A fresh CI machine would otherwise sign with a new random debug key.
+    // It is a sideload key committed on purpose; it is not meant for a store release.
+    signingConfigs {
+        create("sideload") {
+            storeFile = rootProject.file("keystore/shakedj-sideload.jks")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("sideload")
+        }
         release {
             isMinifyEnabled = false
-            // Sideload-friendly: signed with the debug key until a real release key is set up.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("sideload")
         }
     }
 
