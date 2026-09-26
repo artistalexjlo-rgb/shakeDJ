@@ -108,6 +108,14 @@ final class AudioEngine {
     private final double[] scB = new double[SCRATCH_RING];
     private int scN;
 
+    // Time-stretch (WSOLA) for the normal play head: tempo bends keep the pitch. Grains of
+    // wsN output frames are overlap-added every wsHa frames; each grain's input position is
+    // nudged (within a few ms) to where the waveform best continues the previous grain.
+    private int wsN, wsHa, wsIdx;
+    private float[] wsWin, wsL, wsR, wsRef;
+    private double wsPrev;
+    private boolean wsReady;
+
     // Beat grids.
     private boolean trackGrid;
     private double gridOffsetSec;
@@ -139,7 +147,18 @@ final class AudioEngine {
         burst = out.burst;
         kit = DrumKit.build(sampleRate);
         fadeLen = (int) (0.004 * sampleRate);
+        initStretch();
         describeOutput();
+    }
+
+    private void initStretch() {
+        wsN = 2 * (int) Math.round(0.016 * sampleRate); // 32 ms grains, 16 ms hop
+        wsHa = wsN / 2;
+        wsWin = new float[wsN];
+        for (int n = 0; n < wsN; n++) wsWin[n] = (float) (0.5 - 0.5 * Math.cos(2 * Math.PI * n / wsN));
+        wsL = new float[wsN];
+        wsR = new float[wsN];
+        wsRef = new float[wsHa / 4 + 1];
     }
 
     /** Re-opens the output (route change, lost stream) at the engine's rate. */
@@ -218,6 +237,7 @@ final class AudioEngine {
                 speed = 1f;
                 trackGrid = false;
                 hCount = 0;
+                wsReady = false;
             }
         });
     }
@@ -268,6 +288,7 @@ final class AudioEngine {
                 fxNow = FX_NONE;
                 fadeIn = fadeLen;
                 hCount = 0;
+                wsReady = false;
             }
         });
     }
@@ -563,6 +584,7 @@ final class AudioEngine {
         if (fx != FX_FILL) {
             pos = slipPos;
             fadeIn = fadeLen;
+            wsReady = false;
         }
         fx = FX_NONE;
         fxNow = FX_NONE;
@@ -703,9 +725,11 @@ final class AudioEngine {
             if (play) {
                 double rp;
                 float gain = 1f;
+                boolean stretched = false;
                 if (fx == FX_NONE || fx == FX_FILL) {
                     speed += (tgt - speed) * coef;
                     rp = pos;
+                    stretched = true;
                     pos += speed * ratio;
                     if (pos < 0) pos = 0;
                     if (pos >= avail - 1) {
@@ -714,6 +738,7 @@ final class AudioEngine {
                             play = false;
                             pos = 0;
                             pendingFx = FX_NONE;
+                            wsReady = false;
                         } else {
                             pos = Math.max(0, avail - 1);
                         }
@@ -772,7 +797,15 @@ final class AudioEngine {
                     fadeIn--;
                 }
                 lastReadPos = rp;
-                if (gain > 0 && rp >= 0) {
+                if (stretched) {
+                    // Normal playback goes through the time-stretcher, so tempo changes keep the key.
+                    if (!wsReady) stretchReset(d, avail, rp, ratio);
+                    if (wsIdx == wsHa) stretchHop(d, avail, rp, ratio);
+                    float s = gain * bedGain * TRACK_LEVEL * (1f - scDepth * scDuck) / 32768f;
+                    l = wsL[wsIdx] * s;
+                    r = wsR[wsIdx] * s;
+                    wsIdx++;
+                } else if (gain > 0 && rp >= 0) {
                     int i0 = (int) rp;
                     if (i0 + 1 < avail) {
                         float fr = (float) (rp - i0);
@@ -859,6 +892,92 @@ final class AudioEngine {
         }
         speedNow = speed;
         publishBeat(t);
+    }
+
+    // ---- Time-stretch (WSOLA) ----------------------------------------------------------------
+
+    /** Starts the stretcher at input position {@code at}, as if a grain had begun one hop earlier. */
+    private void stretchReset(short[] d, int avail, double at, double ratio) {
+        for (int n = 0; n < wsN; n++) {
+            wsL[n] = 0;
+            wsR[n] = 0;
+        }
+        for (int n = 0; n < wsN - wsHa; n++) {
+            float w = wsWin[n + wsHa];
+            double x = at + n * ratio;
+            wsL[n] = w * sample(d, avail, x, 0);
+            wsR[n] = w * sample(d, avail, x, 1);
+        }
+        wsPrev = at - wsHa * ratio;
+        addGrain(d, avail, at, ratio);
+        wsIdx = 0;
+        wsReady = true;
+    }
+
+    /** One hop is played out: shift the overlap-add buffer and add the next grain. */
+    private void stretchHop(short[] d, int avail, double nominal, double ratio) {
+        System.arraycopy(wsL, wsHa, wsL, 0, wsN - wsHa);
+        System.arraycopy(wsR, wsHa, wsR, 0, wsN - wsHa);
+        for (int n = wsN - wsHa; n < wsN; n++) {
+            wsL[n] = 0;
+            wsR[n] = 0;
+        }
+        addGrain(d, avail, nominal, ratio);
+        wsIdx = 0;
+    }
+
+    private void addGrain(short[] d, int avail, double nominal, double ratio) {
+        // Where the previous grain's audio naturally continues. At speed 1 this *is* the nominal
+        // position, so playback is bit-for-bit the plain track; otherwise search around nominal.
+        double natural = wsPrev + wsHa * ratio;
+        double start = Math.abs(natural - nominal) < 0.5 ? natural : bestStart(d, avail, nominal, natural, ratio);
+        for (int n = 0; n < wsN; n++) {
+            float w = wsWin[n];
+            double x = start + n * ratio;
+            wsL[n] += w * sample(d, avail, x, 0);
+            wsR[n] += w * sample(d, avail, x, 1);
+        }
+        wsPrev = start;
+    }
+
+    /** Input position within ±8 ms of nominal whose waveform best matches the natural continuation. */
+    private double bestStart(short[] d, int avail, double nominal, double natural, double ratio) {
+        int step = 4, m = wsHa / step;
+        double stride = step * ratio;
+        for (int j = 0; j < m; j++) wsRef[j] = mono(d, avail, natural + j * stride);
+        int range = (int) (0.008 * sampleRate * ratio);
+        double best = nominal, bestScore = -Double.MAX_VALUE;
+        for (int off = -range; off <= range; off += 2) {
+            double c = nominal + off;
+            if (c < 0) continue;
+            double dot = 0, en = 1e-9;
+            for (int j = 0; j < m; j++) {
+                float v = mono(d, avail, c + j * stride);
+                dot += wsRef[j] * v;
+                en += v * v;
+            }
+            double score = dot / Math.sqrt(en);
+            if (score > bestScore) {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    private static float sample(short[] d, int avail, double x, int ch) {
+        if (x < 0) return 0;
+        int i0 = (int) x;
+        if (i0 + 1 >= avail) return 0;
+        float fr = (float) (x - i0);
+        int k = i0 * 2 + ch;
+        return d[k] + (d[k + 2] - d[k]) * fr;
+    }
+
+    private static float mono(short[] d, int avail, double x) {
+        int i = (int) x;
+        if (i < 0 || i >= avail) return 0;
+        return d[2 * i] + d[2 * i + 1];
     }
 
     /** Beat position (since a downbeat) of the frame being rendered now; NaN without a grid. */
