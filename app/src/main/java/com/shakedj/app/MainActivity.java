@@ -60,6 +60,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private boolean tiltEnabled = true;
     private boolean warnedBluetooth;
 
+    /** Pad quantization steps in beats; 0 = off. */
+    private static final double[] QUANT_BEATS = {0, 0.25, 0.5, 1};
+    private static final String[] QUANT_NAMES = {"выкл", "1/16", "1/8", "1/4"};
+    private int quantIdx;
+
     /** -1 = cycle through all break types. */
     private int breakMode = -1;
     private int autoBreak;
@@ -236,6 +241,22 @@ public class MainActivity extends Activity implements SensorEventListener {
         engine.sidechain = prefs.getInt("sidechain", 50) / 100f;
         LinearLayout row3 = row();
         row3.setGravity(Gravity.CENTER_VERTICAL);
+        quantIdx = Math.max(0, Math.min(QUANT_BEATS.length - 1, prefs.getInt("quant", 0)));
+        engine.quantizeBeats = QUANT_BEATS[quantIdx];
+        final Button btnQuant = button("Квант: " + QUANT_NAMES[quantIdx]);
+        btnQuant.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                quantIdx = (quantIdx + 1) % QUANT_BEATS.length;
+                engine.quantizeBeats = QUANT_BEATS[quantIdx];
+                btnQuant.setText("Квант: " + QUANT_NAMES[quantIdx]);
+                prefs.edit().putInt("quant", quantIdx).apply();
+                if (quantIdx > 0 && Double.isNaN(engine.beatNow)) {
+                    toast("Кванту нужна сетка: загрузи трек или отстучи BPM с «раза»");
+                }
+            }
+        });
+        row3.addView(btnQuant);
         row3.addView(label("Пэды"));
         row3.addView(slider(200, prefs.getInt("pads", 120), new SliderListener() {
             @Override
@@ -266,13 +287,13 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         deck = new DeckView(this, engine, new DeckView.Callbacks() {
             @Override
-            public void onDeckTap() {
-                engine.hit(DrumKit.KICK, 1f);
+            public void onDeckTap(long nanos) {
+                engine.hitAt(DrumKit.KICK, 1f, nanos);
             }
 
             @Override
-            public void onExtraFingerTap() {
-                engine.hit(DrumKit.CLAP, 0.9f);
+            public void onExtraFingerTap(long nanos) {
+                engine.hitAt(DrumKit.CLAP, 0.9f, nanos);
             }
 
             @Override
@@ -310,8 +331,8 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         PadsView pads = new PadsView(this, new PadsView.Callbacks() {
             @Override
-            public void onPad(int drum) {
-                engine.hit(drum, 1f);
+            public void onPad(int drum, long nanos) {
+                engine.hitAt(drum, 1f, nanos);
             }
         });
         root.addView(pads, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.62f));

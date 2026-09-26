@@ -39,6 +39,8 @@ final class AudioEngine {
     /** How hard each drum pushes the sidechain (kick fully, hats barely). */
     private static final float[] SIDECHAIN_KEY = {1f, 0.7f, 0.7f, 0.15f, 0.3f, 0.5f, 0.4f};
     private static final float FILTER_K = 0.8f;
+    /** A quantized hit that would sound at most this late for its slot plays at once instead of a step later. */
+    private static final double QUANT_LATE_TOLERANCE_SEC = 0.04;
 
     final int sampleRate;
     private final Context ctx;
@@ -62,6 +64,8 @@ final class AudioEngine {
     volatile float drumLevel = 1.2f;
     /** 0..1: how deep drum hits duck the track. The track recovers over half a beat. */
     volatile float sidechain = 0.5f;
+    /** Pad quantization step in beats (0.25 = 1/16 note); 0 = off. */
+    volatile double quantizeBeats;
 
     // Readouts for the UI.
     volatile double positionSec;
@@ -264,6 +268,22 @@ final class AudioEngine {
                 fxNow = FX_NONE;
                 fadeIn = fadeLen;
                 hCount = 0;
+            }
+        });
+    }
+
+    /**
+     * A pad or tap at touch time {@code nanos}. With quantization on (and a beat grid known) the
+     * hit is placed on the grid, see {@link #quantizedClock}; otherwise it plays right away.
+     */
+    void hitAt(final int drum, final float gain, final long nanos) {
+        final double q = quantizeBeats;
+        post(new Runnable() {
+            @Override
+            public void run() {
+                long at = q > 0 ? quantizedClock(nanos, q) : -1;
+                if (at < 0) startVoice(drum, gain);
+                else schedule(at, drum, gain);
             }
         });
     }
@@ -839,6 +859,39 @@ final class AudioEngine {
         }
         speedNow = speed;
         publishBeat(t);
+    }
+
+    /** Beat position (since a downbeat) of the frame being rendered now; NaN without a grid. */
+    private double beatAtCursor() {
+        Track t = track;
+        if (t != null && playing && trackGrid) {
+            double p = fx == FX_NONE || fx == FX_FILL ? pos : slipPos;
+            return (p / t.sampleRate - gridOffsetSec) * bpm / 60.0;
+        }
+        if (clockGrid) return (clock - clockGridOffset) / beatFrames();
+        return Double.NaN;
+    }
+
+    /**
+     * Engine clock at which a hit tapped at {@code nanos} should sound. The player taps along with
+     * what they hear, so the slot they aimed at is the one nearest to the beat that was audible at
+     * the tap. Rendering runs ahead of the speaker by the output latency: if that slot is still
+     * ahead of the render cursor it is hit exactly, otherwise the hit goes to the next slot that can
+     * still be reached. Returns -1 without a beat grid (play immediately).
+     */
+    private long quantizedClock(long nanos, double q) {
+        double now = beatAtCursor();
+        if (Double.isNaN(now)) return -1;
+        double bf = beatFrames();
+        double tapBeat = now - (clock - heardClock(nanos)) / bf;
+        double slot = Math.round(tapBeat / q) * q;
+        double reach = now + 0.001 * sampleRate / bf; // 1 ms of margin
+        if (slot < reach) {
+            // Missed by a hair: a few ms late beats jumping a whole step later.
+            if ((reach - slot) * bf < QUANT_LATE_TOLERANCE_SEC * sampleRate) return clock;
+            slot = Math.ceil(reach / q) * q;
+        }
+        return clock + Math.round((slot - now) * bf);
     }
 
     private void publishBeat(Track t) {

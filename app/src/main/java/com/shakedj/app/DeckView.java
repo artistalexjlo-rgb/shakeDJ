@@ -17,9 +17,10 @@ import android.view.View;
  */
 final class DeckView extends View {
     interface Callbacks {
-        void onDeckTap();
+        /** Tap on the record; {@code nanos} is when the finger landed (the intended moment). */
+        void onDeckTap(long nanos);
 
-        void onExtraFingerTap();
+        void onExtraFingerTap(long nanos);
 
         /** Speed factor and how quickly the engine glides to it. */
         void onSpeed(float speed, float glideSec);
@@ -51,7 +52,7 @@ final class DeckView extends View {
 
     private int mode = NONE;
     private float downX, downY;
-    private long downT;
+    private long downT, downNanos;
     private float bendAmount;
 
     DeckView(Context ctx, AudioEngine engine, Callbacks cb) {
@@ -198,10 +199,11 @@ final class DeckView extends View {
                 downX = e.getX();
                 downY = e.getY();
                 downT = now;
+                downNanos = MainActivity.eventNanos(e);
                 mode = NONE;
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
-                cb.onExtraFingerTap();
+                cb.onExtraFingerTap(MainActivity.eventNanos(e));
                 return true;
             case MotionEvent.ACTION_MOVE: {
                 float x = e.getX(), y = e.getY();
@@ -238,7 +240,7 @@ final class DeckView extends View {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL: {
                 boolean tap = mode == NONE && now - downT < 300 && e.getActionMasked() == MotionEvent.ACTION_UP;
-                if (tap) cb.onDeckTap();
+                if (tap) cb.onDeckTap(downNanos);
                 // Snap straight back to the original tempo; a slow glide smears the groove.
                 if (mode == BEND) cb.onSpeed(1f, 0.004f);
                 if (mode == SCRATCH) cb.onScratchEnd();

@@ -13,7 +13,8 @@ import android.view.View;
 /** Multi-touch drum pads that fire on touch-down for the lowest latency. */
 final class PadsView extends View {
     interface Callbacks {
-        void onPad(int drum);
+        /** {@code nanos}: touch-down time, CLOCK_MONOTONIC. */
+        void onPad(int drum, long nanos);
     }
 
     private static final int COLS = 3, ROWS = 2;
@@ -45,7 +46,7 @@ final class PadsView extends View {
             int idx = e.getActionIndex();
             int pad = padAt(e.getX(idx), e.getY(idx));
             if (pad >= 0) {
-                cb.onPad(DRUMS[pad]);
+                cb.onPad(DRUMS[pad], MainActivity.eventNanos(e));
                 flash[pad] = SystemClock.uptimeMillis();
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 invalidate();
